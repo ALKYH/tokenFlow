@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Transformers.js Example</title>
+  </head>
+  <body>
+    <h1>Transformers.js in Browser</h1>
+    <script type="module">
+      import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers';
+        // 创建一个情感分析的 pipeline
+        const classifier = await pipeline('sentiment-analysis','Xenova/robertuito-sentiment-analysis');
+        // 执行情感分析
+        const result = await classifier('I love Transformers.js!');
+        console.log(result);
+    </script>
+  </body>
+</html>

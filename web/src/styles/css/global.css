@@ -1,0 +1,26 @@
+@import './reset.css';
+@import './nprogress.css';
+@import './transition.css';
+
+html,
+body,
+#app {
+  height: 100%;
+  text-autospace: normal;
+}
+
+html {
+  overflow-x: hidden;
+  color: rgb(var(--base-text-color));
+}
+
+/* Ensure card background (--n-card) is opaque and follows the configured n-card color.
+   Use --n-card-color when present; fallback to white. Use !important to override runtime theme vars. */
+:root {
+  --n-card: var(--n-card-color, #ffffff) !important;
+}
+
+/* Dark mode override: use --n-card-color-dark when available, otherwise a sensible dark fallback */
+html.dark {
+  --n-card: var(--n-card-color-dark, #0f1418) !important;
+}
