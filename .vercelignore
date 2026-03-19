@@ -1,0 +1,9 @@
+node_modules
+.git
+.github
+backend/__pycache__
+web/node_modules
+dist
+venv
+.venv
+*.log
