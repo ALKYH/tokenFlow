@@ -17,6 +17,7 @@ class Plugin(Base):
     icon = Column(String(500), nullable=False, default='')
     tags = Column(JSON, nullable=False, default=list)
     source = Column(JSON, nullable=False, default=dict)
+    route_info = Column(JSON, nullable=False, default=dict)
     workspace_snapshot = Column(JSON, nullable=True)
     node_template_snapshot = Column(JSON, nullable=True)
     is_public = Column(Boolean, nullable=False, default=True)

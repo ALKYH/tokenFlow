@@ -22,13 +22,24 @@ class RoutingRuleRead(BaseModel):
 
 
 class RoutingClassifyRequest(BaseModel):
-    category: str
-    channel: str
+    category: str | None = None
+    channel: str | None = None
     text: str
     use_ai: bool = False
     ai_endpoint: str | None = None
     api_key: str | None = None
     model: str | None = None
+    api_name: str | None = None
+    file_name: str | None = None
+    file_type: str | None = None
+
+
+class RoutingResolveRequest(BaseModel):
+    category: str | None = None
+    channel: str | None = None
+    api_name: str | None = None
+    file_name: str | None = None
+    file_type: str | None = None
 
 
 class RoutingClassifyResponse(BaseModel):
@@ -38,3 +49,7 @@ class RoutingClassifyResponse(BaseModel):
     score: float = 0
     reason: str = ''
     target: dict[str, Any] = Field(default_factory=dict)
+    resolved_category: str | None = None
+    resolved_channel: str | None = None
+    selected_api: dict[str, Any] = Field(default_factory=dict)
+    route_kind: str = 'manual'

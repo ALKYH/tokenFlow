@@ -9,3 +9,5 @@ python-dotenv==1.0.0
 email-validator==2.3.0
 httpx==0.28.1
 cryptography==46.0.1
+python-multipart==0.0.22
+bcrypt==5.0.0

@@ -16,6 +16,7 @@ class PluginRead(BaseModel):
     icon: str = ''
     tags: list[str] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
+    route_info: dict[str, Any] = Field(default_factory=dict)
     workspace_snapshot: dict[str, Any] | None = None
     node_template_snapshot: dict[str, Any] | None = None
     is_public: bool
@@ -35,8 +36,23 @@ class PluginCreate(BaseModel):
     icon: str = ''
     tags: list[str] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
+    route_info: dict[str, Any] = Field(default_factory=dict)
     workspace_snapshot: dict[str, Any] | None = None
     node_template_snapshot: dict[str, Any] | None = None
+    is_public: bool = True
+
+
+class PluginPublishFromWorkspace(BaseModel):
+    workspace_id: int | None = None
+    name: str
+    slug: str
+    summary: str = ''
+    category: str = 'workflow'
+    plugin_type: str = 'module'
+    icon: str = ''
+    tags: list[str] = Field(default_factory=list)
+    request_api_name: str | None = None
+    file_type: str = 'workspace'
     is_public: bool = True
 
 

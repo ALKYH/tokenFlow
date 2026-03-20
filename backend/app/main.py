@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import FRONTEND_ORIGINS
-from .db.session import create_db_and_tables
+from .db.session import create_db_and_tables, ensure_runtime_schema
 from . import models  # noqa: F401
 from .routers import auth as auth_router
 from .routers import inbox as inbox_router
@@ -32,6 +32,7 @@ app.include_router(inbox_router.router)
 @app.on_event('startup')
 async def on_startup():
     await create_db_and_tables()
+    await ensure_runtime_schema()
     await seed_initial_data()
 
 

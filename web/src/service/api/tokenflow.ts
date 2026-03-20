@@ -51,13 +51,16 @@ export async function fetchRoutingRules() {
 }
 
 export async function classifyRoutingMessage(payload: {
-  category: string;
-  channel: string;
+  category?: string;
+  channel?: string;
   text: string;
   use_ai?: boolean;
   ai_endpoint?: string;
   api_key?: string;
   model?: string;
+  api_name?: string;
+  file_name?: string;
+  file_type?: string;
 }) {
   return tokenflowRequest<any>('/api/routing/classify', { method: 'POST', body: payload });
 }
@@ -86,10 +89,50 @@ export async function updateMyProfile(
     preferences?: Record<string, any>
     api_provider?: string
     api_key?: string
+    api_keys?: Array<{
+      provider: string
+      secret_name: string
+      request_prefix?: string
+      priority?: number
+      api_key?: string
+      is_active?: boolean
+    }>
   },
   token: string
 ) {
   return tokenflowRequest<any>('/api/profile/me', { method: 'PATCH', body: payload, token });
+}
+
+export async function resolveRoutingContext(
+  payload: {
+    category?: string
+    channel?: string
+    api_name?: string
+    file_name?: string
+    file_type?: string
+  },
+  token?: string | null
+) {
+  return tokenflowRequest<any>('/api/routing/resolve', { method: 'POST', body: payload, token });
+}
+
+export async function publishWorkspacePlugin(
+  payload: {
+    workspace_id?: number
+    name: string
+    slug: string
+    summary?: string
+    category?: string
+    plugin_type?: string
+    icon?: string
+    tags?: string[]
+    request_api_name?: string
+    file_type?: string
+    is_public?: boolean
+  },
+  token: string
+) {
+  return tokenflowRequest<any>('/api/plugins/publish-workspace', { method: 'POST', body: payload, token });
 }
 
 export function loadInstalledMarketLibrary() {

@@ -2,7 +2,11 @@ from sqlalchemy import desc, or_, select
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..deps import get_current_user, get_optional_user, get_session
 from ..models.plugin import Plugin
-from ..schemas.plugin import PluginCreate, PluginInstallResponse, PluginRead
+from ..models.workspace_file import WorkspaceFile
+from ..schemas.plugin import PluginCreate, PluginInstallResponse, PluginPublishFromWorkspace, PluginRead
+from ..schemas.routing import RoutingResolveRequest
+from ..services.secret_service import build_runtime_secret, resolve_user_secret
+from .routing import _resolve_category_and_channel
 
 router = APIRouter(prefix='/api/plugins', tags=['plugins'])
 
@@ -43,8 +47,60 @@ async def upload_plugin(payload: PluginCreate, session=Depends(get_session), use
         icon=payload.icon,
         tags=payload.tags,
         source=payload.source,
+        route_info=payload.route_info,
         workspace_snapshot=payload.workspace_snapshot,
         node_template_snapshot=payload.node_template_snapshot,
+        is_public=payload.is_public
+    )
+    session.add(plugin)
+    await session.commit()
+    await session.refresh(plugin)
+    return plugin
+
+
+@router.post('/publish-workspace', response_model=PluginRead)
+async def publish_workspace_as_plugin(payload: PluginPublishFromWorkspace, session=Depends(get_session), user=Depends(get_current_user)):
+    workspace = None
+    if payload.workspace_id is not None:
+        workspace = await session.get(WorkspaceFile, payload.workspace_id)
+        if not workspace or workspace.owner_id != user.id:
+            raise HTTPException(status_code=404, detail='Workspace not found')
+
+    runtime_secret = build_runtime_secret(await resolve_user_secret(session, user.id, payload.request_api_name))
+    resolved_category, resolved_channel, route_kind = _resolve_category_and_channel(
+        RoutingResolveRequest(
+            category=payload.category,
+            channel=None,
+            api_name=payload.request_api_name,
+            file_name=workspace.name if workspace else payload.name,
+            file_type=payload.file_type or (workspace.file_type if workspace else 'workspace')
+        ),
+        runtime_secret
+    )
+
+    plugin = Plugin(
+        owner_id=user.id,
+        name=payload.name,
+        slug=payload.slug,
+        summary=payload.summary,
+        category=resolved_category,
+        plugin_type=payload.plugin_type,
+        author_name=user.display_name,
+        icon=payload.icon,
+        tags=payload.tags,
+        source={
+            'channel': 'workspace-publish',
+            'workspace_id': workspace.id if workspace else None,
+            'file_type': payload.file_type or (workspace.file_type if workspace else 'workspace'),
+            'request_api_name': payload.request_api_name
+        },
+        route_info={
+            'category': resolved_category,
+            'channel': resolved_channel,
+            'route_kind': route_kind,
+            'selected_api': {k: v for k, v in runtime_secret.items() if k != 'api_key'}
+        },
+        workspace_snapshot=workspace.content if workspace else None,
         is_public=payload.is_public
     )
     session.add(plugin)
