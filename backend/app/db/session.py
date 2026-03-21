@@ -16,11 +16,21 @@ async def ensure_runtime_schema():
             if dialect == 'sqlite'
             else "ALTER TABLE plugins ADD COLUMN IF NOT EXISTS route_info JSON NOT NULL DEFAULT '{}'::json"
         )
+        plugin_library_kind_statement = "ALTER TABLE plugins ADD COLUMN IF NOT EXISTS library_kind VARCHAR(80) NOT NULL DEFAULT 'personal'"
+        inbox_source_statement = "ALTER TABLE inbox_messages ADD COLUMN IF NOT EXISTS source VARCHAR(120) NOT NULL DEFAULT 'system'"
+        inbox_attachments_statement = (
+            "ALTER TABLE inbox_messages ADD COLUMN IF NOT EXISTS attachments JSON NOT NULL DEFAULT '[]'"
+            if dialect == 'sqlite'
+            else "ALTER TABLE inbox_messages ADD COLUMN IF NOT EXISTS attachments JSON NOT NULL DEFAULT '[]'::json"
+        )
         statements = [
             "ALTER TABLE user_secrets ADD COLUMN IF NOT EXISTS secret_name VARCHAR(120) NOT NULL DEFAULT 'default'",
             "ALTER TABLE user_secrets ADD COLUMN IF NOT EXISTS request_prefix VARCHAR(500) NOT NULL DEFAULT ''",
             "ALTER TABLE user_secrets ADD COLUMN IF NOT EXISTS priority INTEGER NOT NULL DEFAULT 100",
-            plugin_route_info_statement
+            plugin_route_info_statement,
+            plugin_library_kind_statement,
+            inbox_source_statement,
+            inbox_attachments_statement
         ]
         for statement in statements:
             try:

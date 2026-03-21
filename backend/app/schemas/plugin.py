@@ -17,6 +17,7 @@ class PluginRead(BaseModel):
     tags: list[str] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
     route_info: dict[str, Any] = Field(default_factory=dict)
+    library_kind: str = 'personal'
     workspace_snapshot: dict[str, Any] | None = None
     node_template_snapshot: dict[str, Any] | None = None
     is_public: bool
@@ -37,6 +38,7 @@ class PluginCreate(BaseModel):
     tags: list[str] = Field(default_factory=list)
     source: dict[str, Any] = Field(default_factory=dict)
     route_info: dict[str, Any] = Field(default_factory=dict)
+    library_kind: str = 'personal'
     workspace_snapshot: dict[str, Any] | None = None
     node_template_snapshot: dict[str, Any] | None = None
     is_public: bool = True
@@ -54,6 +56,7 @@ class PluginPublishFromWorkspace(BaseModel):
     request_api_name: str | None = None
     file_type: str = 'workspace'
     is_public: bool = True
+    library_kind: str = 'personal'
 
 
 class PluginInstallResponse(BaseModel):

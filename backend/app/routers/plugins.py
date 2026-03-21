@@ -15,6 +15,7 @@ router = APIRouter(prefix='/api/plugins', tags=['plugins'])
 async def list_marketplace_plugins(
     q: str | None = Query(default=None),
     category: str | None = Query(default=None),
+    plugin_type: str | None = Query(default=None),
     session=Depends(get_session)
 ):
     stmt = select(Plugin).where(Plugin.is_public.is_(True))
@@ -23,19 +24,34 @@ async def list_marketplace_plugins(
       stmt = stmt.where(or_(Plugin.name.ilike(like), Plugin.summary.ilike(like), Plugin.author_name.ilike(like)))
     if category and category != 'all':
       stmt = stmt.where(Plugin.category == category)
+    if plugin_type and plugin_type != 'all':
+      stmt = stmt.where(Plugin.plugin_type == plugin_type)
     result = await session.execute(stmt.order_by(desc(Plugin.installs), desc(Plugin.updated_at)))
     return list(result.scalars().all())
 
 
 @router.get('/library', response_model=list[PluginRead])
-async def list_my_plugins(session=Depends(get_session), user=Depends(get_current_user)):
-    stmt = select(Plugin).where(Plugin.owner_id == user.id).order_by(desc(Plugin.updated_at))
+async def list_my_plugins(
+    plugin_type: str | None = Query(default=None),
+    library_kind: str | None = Query(default=None),
+    session=Depends(get_session),
+    user=Depends(get_current_user)
+):
+    stmt = select(Plugin).where(Plugin.owner_id == user.id)
+    if plugin_type and plugin_type != 'all':
+        stmt = stmt.where(Plugin.plugin_type == plugin_type)
+    if library_kind and library_kind != 'all':
+        stmt = stmt.where(Plugin.library_kind == library_kind)
+    stmt = stmt.order_by(desc(Plugin.updated_at))
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
 
 @router.post('/upload', response_model=PluginRead)
 async def upload_plugin(payload: PluginCreate, session=Depends(get_session), user=Depends(get_current_user)):
+    existing = await session.execute(select(Plugin).where(Plugin.slug == payload.slug))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail='Plugin slug already exists')
     plugin = Plugin(
         owner_id=user.id,
         name=payload.name,
@@ -48,6 +64,7 @@ async def upload_plugin(payload: PluginCreate, session=Depends(get_session), use
         tags=payload.tags,
         source=payload.source,
         route_info=payload.route_info,
+        library_kind=payload.library_kind,
         workspace_snapshot=payload.workspace_snapshot,
         node_template_snapshot=payload.node_template_snapshot,
         is_public=payload.is_public
@@ -100,6 +117,7 @@ async def publish_workspace_as_plugin(payload: PluginPublishFromWorkspace, sessi
             'route_kind': route_kind,
             'selected_api': {k: v for k, v in runtime_secret.items() if k != 'api_key'}
         },
+        library_kind=payload.library_kind,
         workspace_snapshot=workspace.content if workspace else None,
         is_public=payload.is_public
     )

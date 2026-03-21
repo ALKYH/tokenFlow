@@ -16,6 +16,7 @@ class WorkspaceFileRead(BaseModel):
 
 
 class WorkspaceFileCreate(BaseModel):
+    id: int | None = None
     name: str
     description: str = ''
     file_type: str = 'workspace'

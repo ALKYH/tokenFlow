@@ -3,27 +3,30 @@ import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import SvgIcon from '@/components/custom/svg-icon.vue';
 import {
+  fetchInboxChannels,
   fetchMarketplacePlugins,
   fetchMyCloudWorkspaces,
+  fetchMyPluginLibrary,
   fetchMyProfile,
-  getStoredAccessToken
+  getStoredAccessToken,
+  loadWorkspaceSnapshots,
+  parseWorkspaceFile,
+  savePendingWorkspaceImport,
+  saveWorkspaceSnapshot,
+  type WorkspaceSnapshot
 } from '@/service/api';
 import { getLocale } from '@/locales';
 
-type WorkspaceSnapshot = {
-  name?: string;
-  description?: string;
-  nodeCount?: number;
-  edgeCount?: number;
-  updatedAt?: string;
-  id?: string;
-};
-
 const router = useRouter();
 const isZh = computed(() => getLocale() === 'zh-CN');
-const modules = ref<WorkspaceSnapshot[]>([]);
+const localModules = ref<WorkspaceSnapshot[]>([]);
+const cloudModules = ref<any[]>([]);
 const cloudWorkspaces = ref<any[]>([]);
 const popularModules = ref<any[]>([]);
+const inboxChannels = ref<any[]>([]);
+const loading = ref(false);
+const fileInputRef = ref<HTMLInputElement | null>(null);
+
 const profile = ref({
   name: 'TokenFlow Builder',
   role: 'Visual Pipeline Engineer',
@@ -31,54 +34,9 @@ const profile = ref({
   email: 'Sign in to sync'
 });
 
-const inboxMessages = computed(() => [
-  {
-    title: isZh.value ? '知识库索引已空闲' : 'Knowledge indexing is idle',
-    detail: isZh.value ? '最近一轮 PDF 入库任务已完成，可继续追加文件。' : 'The latest PDF ingestion run completed successfully.',
-    time: isZh.value ? '刚刚' : 'Just now',
-    tone: 'success'
-  },
-  {
-    title: isZh.value ? '第三方包调试提醒' : 'Package debug reminder',
-    detail: isZh.value ? '如果代码模块运行失败，请先检查工具台中的安装日志。' : 'Check the tool panel install logs when Python packages fail.',
-    time: isZh.value ? '10 分钟前' : '10 min ago',
-    tone: 'warning'
-  },
-  {
-    title: isZh.value ? '社区市场已同步' : 'Marketplace synced',
-    detail: isZh.value ? '热门模块推荐会优先展示社区内下载量更高的工作流。' : 'Popular module cards are ranked from marketplace installs.',
-    time: isZh.value ? '今天' : 'Today',
-    tone: 'info'
-  }
-]);
-
-const routeStatus = computed(() => [
-  {
-    label: isZh.value ? '模块工作区' : 'Workspace',
-    value: isZh.value ? '正常' : 'Healthy',
-    desc: isZh.value ? '节点编辑器与工具台可直接进入' : 'Editor and tool panel are available',
-    icon: 'solar:widget-3-linear',
-    tone: 'success'
-  },
-  {
-    label: isZh.value ? '知识库链路' : 'Knowledge Flow',
-    value: isZh.value ? '在线' : 'Online',
-    desc: isZh.value ? 'PDF 解析、分块、Embedding 与检索节点可见' : 'Parsing, chunking and retrieval nodes are visible',
-    icon: 'solar:database-linear',
-    tone: 'info'
-  },
-  {
-    label: isZh.value ? '社区市场' : 'Marketplace',
-    value: isZh.value ? '可用' : 'Ready',
-    desc: isZh.value ? '支持将市场模块导入个人模块库' : 'Supports importing market modules into local library',
-    icon: 'solar:shop-linear',
-    tone: 'warning'
-  }
-]);
-
-const totalNodes = computed(() => modules.value.reduce((sum, item) => sum + (item.nodeCount || 0), 0));
-const latestModule = computed(() => modules.value[0] || null);
-const cloudCount = computed(() => cloudWorkspaces.value.length);
+const totalNodes = computed(() => localModules.value.reduce((sum, item) => sum + Number(item.stats?.nodes || 0), 0));
+const latestModule = computed(() => localModules.value[0] || null);
+const token = computed(() => getStoredAccessToken());
 
 function t(zh: string, en: string) {
   return isZh.value ? zh : en;
@@ -93,82 +51,122 @@ function formatTime(value?: string) {
   }
 }
 
-function openWorkspace() {
-  router.push('/blank');
+function refreshLocalModules() {
+  localModules.value = loadWorkspaceSnapshots().sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
 }
 
-function openModule(moduleId?: string) {
-  router.push({ path: '/blank', query: moduleId ? { module: moduleId } : {} });
+function openBlank(query: Record<string, string> = {}) {
+  router.push({ path: '/blank', query });
 }
 
-onMounted(async () => {
+function openLocalModule(moduleId?: string) {
+  if (!moduleId) return openBlank();
+  openBlank({ module: moduleId, source: 'local' });
+}
+
+function openCloudModule(item: any) {
+  openBlank({ cloudPlugin: String(item.id), source: 'cloud-library' });
+}
+
+function openCloudWorkspace(item: any) {
+  openBlank({ workspaceId: String(item.id), source: 'cloud-workspace' });
+}
+
+function triggerFileImport() {
+  fileInputRef.value?.click();
+}
+
+async function handleFileImport(event: Event) {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+
   try {
-    const raw = localStorage.getItem('tokenflow.workspace.modules.v1');
-    const parsed = raw ? JSON.parse(raw) : [];
-    const list = Array.isArray(parsed?.modules) ? parsed.modules : Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
-    modules.value = list
-      .map((item: any, index: number) => ({
-        id: item.id || `workspace-${index + 1}`,
-        name: item.name || `Workspace ${index + 1}`,
-        description: item.description || t('可视化工作区模块', 'Visual workspace module'),
-        nodeCount: item.stats?.nodes || item.nodeCount || item.nodes?.length || 0,
-        edgeCount: item.stats?.edges || item.edgeCount || item.edges?.length || 0,
-        updatedAt: item.updatedAt || item.savedAt || ''
-      }))
-      .sort((a: WorkspaceSnapshot, b: WorkspaceSnapshot) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
-  } catch {
-    modules.value = [];
+    const snapshot = await parseWorkspaceFile(file);
+    const saved = saveWorkspaceSnapshot({
+      ...snapshot,
+      meta: { ...(snapshot.meta || {}), source: 'file-import', tags: [...(snapshot.meta?.tags || []), 'file-import'] }
+    });
+    savePendingWorkspaceImport(saved);
+    refreshLocalModules();
+    window.$message?.success(t('已读取本地模块文件，正在进入工作区', 'Module file loaded, opening workspace'));
+    openBlank({ pending: '1', source: 'file-import' });
+  } catch (error: any) {
+    window.$message?.error(error?.message || t('模块文件解析失败', 'Failed to parse module file'));
+  } finally {
+    input.value = '';
   }
+}
+
+async function loadData() {
+  loading.value = true;
+  refreshLocalModules();
 
   try {
-    const market = await fetchMarketplacePlugins();
-    popularModules.value = market.slice(0, 3);
+    popularModules.value = (await fetchMarketplacePlugins({ plugin_type: 'module' })).slice(0, 3);
   } catch {
     popularModules.value = [];
   }
 
-  const token = getStoredAccessToken();
-  if (!token) return;
+  try {
+    inboxChannels.value = await fetchInboxChannels(token.value || undefined);
+  } catch {
+    inboxChannels.value = [];
+  }
 
-  fetchMyProfile(token)
-    .then(data => {
-      profile.value = {
-        name: data.display_name || 'TokenFlow User',
-        role: t('云端工作区成员', 'Cloud Workspace Member'),
-        note: data.bio || t('已连接到个人资料服务。', 'Connected to profile service.'),
-        email: data.email || ''
-      };
-    })
-    .catch(() => {});
+  if (!token.value) {
+    loading.value = false;
+    return;
+  }
 
-  fetchMyCloudWorkspaces(token)
-    .then(data => {
-      cloudWorkspaces.value = data;
-    })
-    .catch(() => {});
-});
+  try {
+    const [profileData, libraryData, workspaceData] = await Promise.all([
+      fetchMyProfile(token.value),
+      fetchMyPluginLibrary({ plugin_type: 'module' }, token.value),
+      fetchMyCloudWorkspaces(token.value)
+    ]);
+
+    profile.value = {
+      name: profileData.display_name || 'TokenFlow User',
+      role: t('个人模块库成员', 'Personal Library Member'),
+      note: profileData.bio || t('已连接个人资料与云端模块服务', 'Connected to profile and cloud module services.'),
+      email: profileData.email || ''
+    };
+    cloudModules.value = libraryData;
+    cloudWorkspaces.value = workspaceData;
+  } catch {
+    cloudModules.value = [];
+    cloudWorkspaces.value = [];
+  } finally {
+    loading.value = false;
+  }
+}
+
+onMounted(loadData);
 </script>
 
 <template>
   <div class="home-dashboard">
+    <input ref="fileInputRef" type="file" accept=".json" style="display:none" @change="handleFileImport" />
+
     <div class="hero-card">
       <div class="hero-copy">
         <div class="hero-kicker">Flow Workspace</div>
-        <h1 class="hero-title">{{ t('模块总览与工作台入口', 'Workspace Overview And Entry') }}</h1>
+        <h1 class="hero-title">{{ t('模块总览与云端同步入口', 'Module Overview And Cloud Sync') }}</h1>
         <p class="hero-desc">
-          {{ t('统一查看本地模块、市场推荐、路由状态与云端文件，并从这里继续进入节点工作区。', 'Review local modules, market picks, routing status and cloud files, then jump back into the node editor.') }}
+          {{ t('在这里统一查看本地模块、云端个人模块库、云端工作区文件和收件箱渠道，并支持直接读取本地模块文件进入编辑器。', 'Review local modules, personal cloud modules, cloud workspaces and inbox channels, and open local module files directly into the editor.') }}
         </p>
         <div class="hero-actions">
-          <NButton type="primary" size="large" @click="openWorkspace">
-            <template #icon>
-              <SvgIcon icon="solar:play-circle-linear" />
-            </template>
+          <NButton type="primary" size="large" @click="openBlank()">
+            <template #icon><SvgIcon icon="solar:play-circle-linear" /></template>
             {{ t('进入工作区', 'Open Workspace') }}
           </NButton>
-          <NButton size="large" secondary @click="openModule(latestModule?.id)">
-            <template #icon>
-              <SvgIcon icon="solar:folder-open-linear" />
-            </template>
+          <NButton size="large" secondary @click="triggerFileImport">
+            <template #icon><SvgIcon icon="solar:upload-linear" /></template>
+            {{ t('读取本地模块文件', 'Load Local Module File') }}
+          </NButton>
+          <NButton size="large" tertiary @click="openLocalModule(latestModule?.id)">
+            <template #icon><SvgIcon icon="solar:folder-open-linear" /></template>
             {{ t('打开最近模块', 'Open Latest Module') }}
           </NButton>
         </div>
@@ -177,49 +175,48 @@ onMounted(async () => {
       <div class="hero-metrics">
         <div class="metric-card">
           <div class="metric-label">{{ t('本地模块', 'Local Modules') }}</div>
-          <div class="metric-value">{{ modules.length }}</div>
+          <div class="metric-value">{{ localModules.length }}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">{{ t('云端个人模块', 'Cloud Modules') }}</div>
+          <div class="metric-value">{{ cloudModules.length }}</div>
         </div>
         <div class="metric-card">
           <div class="metric-label">{{ t('累计节点', 'Total Nodes') }}</div>
           <div class="metric-value">{{ totalNodes }}</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">{{ t('最近更新', 'Last Updated') }}</div>
-          <div class="metric-value metric-sm">{{ formatTime(latestModule?.updatedAt) }}</div>
-        </div>
-        <div class="metric-card">
-          <div class="metric-label">{{ t('云端文件', 'Cloud Files') }}</div>
-          <div class="metric-value">{{ cloudCount }}</div>
+          <div class="metric-label">{{ t('收件箱渠道', 'Inbox Channels') }}</div>
+          <div class="metric-value">{{ inboxChannels.length }}</div>
         </div>
       </div>
     </div>
 
     <NGrid :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
-      <NGi span="24 s:24 m:16">
+      <NGi span="24 s:24 m:12">
         <NCard :bordered="false" class="panel-card">
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('模块管理', 'Module Management') }}</div>
-                <div class="panel-subtitle">{{ t('管理本地多个模块，点击即可进入工作区查看内部节点', 'Browse local workspace projects and jump into the editor.') }}</div>
+                <div class="panel-title">{{ t('本地模块', 'Local Modules') }}</div>
+                <div class="panel-subtitle">{{ t('从浏览器本地快照或导入文件继续进入可视化编辑器', 'Resume from browser snapshots or imported files.') }}</div>
               </div>
-              <NButton tertiary @click="openWorkspace">{{ t('查看全部', 'View All') }}</NButton>
+              <NButton tertiary @click="triggerFileImport">{{ t('导入文件', 'Import File') }}</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!modules.length" :description="t('还没有本地模块快照，先进入工作区创建模块吧', 'No local workspace snapshots yet.')" />
-
-          <div v-else class="module-list">
-            <div v-for="item in modules" :key="item.id" class="module-card" @click="openModule(item.id)">
-              <div class="module-card-head">
+          <NEmpty v-if="!localModules.length" :description="t('还没有本地模块，先在工作区创建或导入一个', 'No local modules yet.')" />
+          <div v-else class="card-list">
+            <div v-for="item in localModules" :key="item.id" class="module-card" @click="openLocalModule(item.id)">
+              <div class="card-head">
                 <div>
-                  <div class="module-card-title">{{ item.name }}</div>
-                  <div class="module-card-desc">{{ item.description }}</div>
+                  <div class="module-title">{{ item.name }}</div>
+                  <div class="module-desc">{{ item.description }}</div>
                 </div>
-                <NTag round type="info">{{ item.nodeCount || 0 }} {{ t('节点', 'nodes') }}</NTag>
+                <NTag round type="info">{{ item.stats.nodes }} {{ t('节点', 'nodes') }}</NTag>
               </div>
-              <div class="module-card-meta">
-                <span>{{ item.edgeCount || 0 }} {{ t('连线', 'edges') }}</span>
+              <div class="card-meta">
+                <span>{{ item.stats.edges }} {{ t('连线', 'edges') }}</span>
                 <span>{{ formatTime(item.updatedAt) }}</span>
               </div>
             </div>
@@ -227,83 +224,35 @@ onMounted(async () => {
         </NCard>
       </NGi>
 
-      <NGi span="24 s:24 m:8">
-        <NCard :bordered="false" class="panel-card">
-          <template #header>
-            <div class="panel-header">
-              <div>
-                <div class="panel-title">{{ t('最新消息', 'Latest Messages') }}</div>
-                <div class="panel-subtitle">{{ t('编辑提醒、调试建议与市场更新', 'Editor reminders, debug tips and market updates') }}</div>
-              </div>
-            </div>
-          </template>
-
-          <div class="inbox-list">
-            <div v-for="item in inboxMessages" :key="item.title" class="inbox-item" :class="item.tone">
-              <div class="inbox-title">{{ item.title }}</div>
-              <div class="inbox-detail">{{ item.detail }}</div>
-              <div class="inbox-time">{{ item.time }}</div>
-            </div>
-          </div>
-        </NCard>
-      </NGi>
-    </NGrid>
-
-    <NGrid :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
       <NGi span="24 s:24 m:12">
         <NCard :bordered="false" class="panel-card">
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('热门市场模块', 'Popular Market Modules') }}</div>
-                <div class="panel-subtitle">{{ t('从社区市场中推荐下载量和安装量更高的模块', 'Top modules from the community marketplace') }}</div>
+                <div class="panel-title">{{ t('个人模块库', 'Personal Module Library') }}</div>
+                <div class="panel-subtitle">{{ t('显示后端保存到个人模块库的云端模块', 'Cloud modules saved into your personal library.') }}</div>
               </div>
-              <NButton tertiary @click="router.push('/marketplace')">{{ t('进入市场', 'Open Market') }}</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!popularModules.length" :description="t('暂时没有可展示的市场推荐', 'No market recommendations yet')" />
-          <div v-else class="module-list">
-            <div v-for="item in popularModules" :key="item.id" class="module-card" @click="router.push('/marketplace')">
-              <div class="module-card-head">
-                <div>
-                  <div class="module-card-title">{{ item.name }}</div>
-                  <div class="module-card-desc">{{ item.summary }}</div>
+          <NSpin :show="loading">
+            <NEmpty v-if="!cloudModules.length" :description="t('未登录或云端模块库为空', 'Sign in to load your cloud module library')" />
+            <div v-else class="card-list">
+              <div v-for="item in cloudModules" :key="item.id" class="module-card" @click="openCloudModule(item)">
+                <div class="card-head">
+                  <div>
+                    <div class="module-title">{{ item.name }}</div>
+                    <div class="module-desc">{{ item.summary || t('个人云端模块', 'Personal cloud module') }}</div>
+                  </div>
+                  <NTag round type="success">{{ item.plugin_type }}</NTag>
                 </div>
-                <NTag round type="success">{{ item.category }}</NTag>
-              </div>
-              <div class="module-card-meta">
-                <span>{{ item.installs || 0 }} installs</span>
-                <span>{{ item.author_name || 'TokenFlow' }}</span>
-              </div>
-            </div>
-          </div>
-        </NCard>
-      </NGi>
-
-      <NGi span="24 s:24 m:12">
-        <NCard :bordered="false" class="panel-card">
-          <template #header>
-            <div class="panel-header">
-              <div>
-                <div class="panel-title">{{ t('路由工作情况', 'Routing Status') }}</div>
-                <div class="panel-subtitle">{{ t('查看工作区、知识库和社区市场链路状态', 'Track workspace, knowledge and market flows') }}</div>
+                <div class="card-meta">
+                  <span>{{ item.category }}</span>
+                  <span>{{ formatTime(item.updated_at) }}</span>
+                </div>
               </div>
             </div>
-          </template>
-
-          <div class="route-list">
-            <div v-for="item in routeStatus" :key="item.label" class="route-card">
-              <div class="route-icon">
-                <SvgIcon :icon="item.icon" />
-              </div>
-              <div class="route-copy">
-                <div class="route-title">{{ item.label }}</div>
-                <div class="route-desc">{{ item.desc }}</div>
-              </div>
-              <NTag round :type="item.tone as any">{{ item.value }}</NTag>
-            </div>
-          </div>
+          </NSpin>
         </NCard>
       </NGi>
     </NGrid>
@@ -315,15 +264,12 @@ onMounted(async () => {
             <div class="panel-header">
               <div>
                 <div class="panel-title">{{ t('个人信息', 'Profile') }}</div>
-                <div class="panel-subtitle">{{ t('点击顶部头像可修改个人偏好和云端 API Key', 'Use the top avatar modal to edit preferences and cloud API keys') }}</div>
+                <div class="panel-subtitle">{{ t('登录后可同步模块、节点库和消息渠道', 'Sign in to sync modules, node library and inbox channels.') }}</div>
               </div>
             </div>
           </template>
-
           <div class="profile-body">
-            <div class="profile-avatar">
-              <SvgIcon icon="solar:user-circle-linear" />
-            </div>
+            <div class="profile-avatar"><SvgIcon icon="solar:user-circle-linear" /></div>
             <div class="profile-name">{{ profile.name }}</div>
             <div class="profile-role">{{ profile.role }}</div>
             <div class="profile-note">{{ profile.email }}</div>
@@ -337,23 +283,81 @@ onMounted(async () => {
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('云端工作文件', 'Cloud Workspace Files') }}</div>
-                <div class="panel-subtitle">{{ t('登录后可读取 PostgreSQL 中保存的工作区快照', 'Workspace snapshots stored in PostgreSQL') }}</div>
+                <div class="panel-title">{{ t('收件箱渠道', 'Inbox Channels') }}</div>
+                <div class="panel-subtitle">{{ t('查看消息渠道数量，并前往收件箱管理接入方式', 'Review channel counts and manage intake methods in Inbox.') }}</div>
+              </div>
+              <NButton tertiary @click="router.push('/inbox')">{{ t('前往收件箱', 'Open Inbox') }}</NButton>
+            </div>
+          </template>
+
+          <NEmpty v-if="!inboxChannels.length" :description="t('暂无渠道统计', 'No channel stats yet')" />
+          <div v-else class="card-list">
+            <div v-for="item in inboxChannels" :key="item.channel" class="channel-card">
+              <div>
+                <div class="module-title">{{ item.channel }}</div>
+                <div class="module-desc">{{ item.unread }} {{ t('未读', 'unread') }}</div>
+              </div>
+              <NTag round type="warning">{{ item.count }}</NTag>
+            </div>
+          </div>
+        </NCard>
+      </NGi>
+    </NGrid>
+
+    <NGrid :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
+      <NGi span="24 s:24 m:12">
+        <NCard :bordered="false" class="panel-card">
+          <template #header>
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">{{ t('热门模块', 'Popular Modules') }}</div>
+                <div class="panel-subtitle">{{ t('从社区市场推荐较常用的模块模板', 'Recommended modules from the marketplace.') }}</div>
+              </div>
+              <NButton tertiary @click="router.push('/marketplace')">{{ t('进入市场', 'Open Market') }}</NButton>
+            </div>
+          </template>
+
+          <NEmpty v-if="!popularModules.length" :description="t('暂无市场推荐', 'No market recommendations yet')" />
+          <div v-else class="card-list">
+            <div v-for="item in popularModules" :key="item.id" class="module-card" @click="router.push('/marketplace')">
+              <div class="card-head">
+                <div>
+                  <div class="module-title">{{ item.name }}</div>
+                  <div class="module-desc">{{ item.summary }}</div>
+                </div>
+                <NTag round type="success">{{ item.category }}</NTag>
+              </div>
+              <div class="card-meta">
+                <span>{{ item.installs || 0 }} installs</span>
+                <span>{{ item.author_name }}</span>
+              </div>
+            </div>
+          </div>
+        </NCard>
+      </NGi>
+
+      <NGi span="24 s:24 m:12">
+        <NCard :bordered="false" class="panel-card">
+          <template #header>
+            <div class="panel-header">
+              <div>
+                <div class="panel-title">{{ t('云端工作区文件', 'Cloud Workspace Files') }}</div>
+                <div class="panel-subtitle">{{ t('读取后端保存的工作区文件并继续编辑', 'Open backend-saved workspace files and continue editing.') }}</div>
               </div>
             </div>
           </template>
 
-          <NEmpty v-if="!cloudWorkspaces.length" :description="t('当前没有云端工作文件，或尚未连接到后端账号', 'No cloud files yet or backend login is not active')" />
-          <div v-else class="module-list">
-            <div v-for="item in cloudWorkspaces" :key="item.id" class="module-card">
-              <div class="module-card-head">
+          <NEmpty v-if="!cloudWorkspaces.length" :description="t('暂无云端工作区文件', 'No cloud workspace files yet')" />
+          <div v-else class="card-list">
+            <div v-for="item in cloudWorkspaces" :key="item.id" class="module-card" @click="openCloudWorkspace(item)">
+              <div class="card-head">
                 <div>
-                  <div class="module-card-title">{{ item.name }}</div>
-                  <div class="module-card-desc">{{ item.description }}</div>
+                  <div class="module-title">{{ item.name }}</div>
+                  <div class="module-desc">{{ item.description }}</div>
                 </div>
-                <NTag round type="success">{{ item.file_type }}</NTag>
+                <NTag round type="primary">{{ item.file_type }}</NTag>
               </div>
-              <div class="module-card-meta">
+              <div class="card-meta">
                 <span>ID {{ item.id }}</span>
                 <span>{{ formatTime(item.updated_at) }}</span>
               </div>
@@ -374,32 +378,32 @@ onMounted(async () => {
 
 .hero-card {
   display: grid;
-  grid-template-columns: 1.4fr .9fr;
+  grid-template-columns: 1.3fr .9fr;
   gap: 16px;
   padding: 24px;
   border-radius: 28px;
   background:
     radial-gradient(circle at top left, rgba(59, 130, 246, 0.18), transparent 34%),
-    radial-gradient(circle at bottom right, rgba(16, 185, 129, 0.16), transparent 28%),
+    radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.14), transparent 30%),
     linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.92));
   border: 1px solid rgba(148, 163, 184, 0.16);
   box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
 }
 
 .hero-kicker,
-.panel-subtitle,
+.hero-desc,
 .metric-label,
-.module-card-meta,
-.inbox-time,
-.profile-role {
+.card-meta,
+.profile-role,
+.profile-note,
+.panel-subtitle {
   font-size: 12px;
   color: #64748b;
 }
 
 .hero-title,
 .panel-title,
-.module-card-title,
-.route-title,
+.module-title,
 .profile-name {
   color: #0f172a;
   font-weight: 700;
@@ -408,14 +412,10 @@ onMounted(async () => {
 .hero-title {
   margin: 8px 0 10px;
   font-size: 32px;
-  line-height: 1.15;
 }
 
 .hero-desc,
-.module-card-desc,
-.inbox-detail,
-.route-desc,
-.profile-note {
+.module-desc {
   color: #475569;
   line-height: 1.65;
 }
@@ -427,15 +427,15 @@ onMounted(async () => {
   margin-top: 18px;
 }
 
-.hero-metrics {
+.hero-metrics,
+.card-list {
   display: grid;
   gap: 12px;
 }
 
 .metric-card,
 .module-card,
-.inbox-item,
-.route-card {
+.channel-card {
   border: 1px solid rgba(148, 163, 184, 0.16);
   background: rgba(255, 255, 255, 0.82);
   border-radius: 20px;
@@ -449,28 +449,23 @@ onMounted(async () => {
   color: #0f172a;
 }
 
-.metric-sm {
-  font-size: 15px;
-  line-height: 1.5;
-}
-
 .panel-card {
   border-radius: 24px;
   box-shadow: 0 16px 40px rgba(15, 23, 42, 0.06);
 }
 
-.panel-header {
+.panel-header,
+.card-head,
+.card-meta,
+.channel-card {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
 }
 
-.module-list,
-.inbox-list,
-.route-list {
-  display: grid;
-  gap: 12px;
+.card-head {
+  align-items: flex-start;
 }
 
 .module-card {
@@ -482,58 +477,6 @@ onMounted(async () => {
   transform: translateY(-2px);
   border-color: rgba(59, 130, 246, 0.24);
   box-shadow: 0 16px 30px rgba(37, 99, 235, 0.08);
-}
-
-.module-card-head,
-.module-card-meta,
-.route-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-}
-
-.module-card-head {
-  align-items: flex-start;
-}
-
-.inbox-item.success {
-  background: rgba(240, 253, 244, 0.9);
-}
-
-.inbox-item.warning {
-  background: rgba(255, 251, 235, 0.92);
-}
-
-.inbox-item.info {
-  background: rgba(239, 246, 255, 0.9);
-}
-
-.inbox-title {
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.inbox-time {
-  margin-top: 8px;
-}
-
-.route-icon {
-  display: grid;
-  place-items: center;
-  width: 42px;
-  height: 42px;
-  border-radius: 14px;
-  background: rgba(37, 99, 235, 0.08);
-  color: #1d4ed8;
-}
-
-.route-copy {
-  flex: 1;
-}
-
-.profile-card {
-  height: 100%;
 }
 
 .profile-body {
@@ -551,7 +494,7 @@ onMounted(async () => {
   width: 76px;
   height: 76px;
   border-radius: 24px;
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(16, 185, 129, 0.12));
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.12), rgba(14, 165, 233, 0.12));
   color: #1d4ed8;
   font-size: 34px;
 }
@@ -566,38 +509,31 @@ onMounted(async () => {
   .hero-card,
   .metric-card,
   .module-card,
-  .inbox-item,
-  .route-card {
-    background: rgba(15, 23, 42, 0.8);
+  .channel-card {
+    background: rgba(15, 23, 42, 0.82);
     border-color: rgba(71, 85, 105, 0.3);
     box-shadow: 0 24px 60px rgba(2, 6, 23, 0.22);
   }
 
   .hero-title,
   .panel-title,
-  .module-card-title,
-  .route-title,
-  .profile-name,
+  .module-title,
   .metric-value,
-  .inbox-title {
+  .profile-name {
     color: #e2e8f0;
   }
 
   .hero-kicker,
-  .panel-subtitle,
-  .metric-label,
-  .module-card-meta,
-  .inbox-time,
-  .profile-role,
   .hero-desc,
-  .module-card-desc,
-  .inbox-detail,
-  .route-desc,
-  .profile-note {
+  .metric-label,
+  .card-meta,
+  .profile-role,
+  .profile-note,
+  .module-desc,
+  .panel-subtitle {
     color: #94a3b8;
   }
 
-  .route-icon,
   .profile-avatar {
     background: rgba(59, 130, 246, 0.16);
     color: #93c5fd;

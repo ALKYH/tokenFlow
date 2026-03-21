@@ -1,34 +1,64 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { classifyRoutingMessage, fetchRoutingRules, getTokenflowApiUrl } from '@/service/api';
+import {
+  classifyRoutingMessage,
+  fetchRoutingRules,
+  fetchRoutingSummary,
+  getStoredAccessToken,
+  resolveRoutingContext,
+  saveRoutingRule,
+  updateRoutingRule
+} from '@/service/api';
 import { getLocale } from '@/locales';
 
 const rules = ref<any[]>([]);
+const summary = ref({ categories: ['general'], channels: ['dashboard'], rule_count: 0, enabled_count: 0 });
 const loading = ref(false);
 const classifyLoading = ref(false);
+const savingRule = ref(false);
 const selectedCategory = ref('billing');
 const selectedChannel = ref('email');
 const messageText = ref('Customer asks for invoice reissue because payment failed.');
+const fileType = ref('workspace');
 const classifierMode = ref<'rule' | 'ai'>('rule');
-const aiEndpoint = ref('');
-const apiKey = ref('');
 const classificationResult = ref<any | null>(null);
+const draftRule = ref({
+  name: 'New Personal Rule',
+  category: 'workspace',
+  channel: 'dashboard',
+  matcher_type: 'keyword',
+  matcher_config: { keywords: ['module', 'workflow'] },
+  action_config: { target: 'personal-library', priority: 'medium' },
+  classifier_mode: 'rule',
+  priority: 90,
+  enabled: true,
+  is_public: false
+});
+const matcherKeywordsText = ref('module\nworkflow');
+const actionConfigText = ref('{\n  "target": "personal-library",\n  "priority": "medium"\n}');
+const editingRuleId = ref<number | null>(null);
 const isZh = computed(() => getLocale() === 'zh-CN');
 
-const categories = ['billing', 'marketplace', 'knowledge'];
-const channels = ['email', 'community', 'api'];
-
 const groupedRules = computed(() =>
-  categories.map(category => ({
+  summary.value.categories.map(category => ({
     category,
     items: rules.value.filter(rule => rule.category === category)
   }))
 );
 
+function t(zh: string, en: string) {
+  return isZh.value ? zh : en;
+}
+
 async function loadRules() {
   loading.value = true;
   try {
-    rules.value = await fetchRoutingRules();
+    const token = getStoredAccessToken() || undefined;
+    const [rulesData, summaryData] = await Promise.all([fetchRoutingRules(token), fetchRoutingSummary(token)]);
+    rules.value = rulesData;
+    summary.value = summaryData;
+    selectedCategory.value = summaryData.categories[0] || selectedCategory.value;
+    selectedChannel.value = summaryData.channels[0] || selectedChannel.value;
   } catch {
     rules.value = [];
   } finally {
@@ -39,14 +69,29 @@ async function loadRules() {
 async function runClassifier() {
   classifyLoading.value = true;
   try {
-    classificationResult.value = await classifyRoutingMessage({
-      category: selectedCategory.value,
-      channel: selectedChannel.value,
+    const resolved = await resolveRoutingContext(
+      {
+        category: selectedCategory.value,
+        channel: selectedChannel.value,
+        file_name: 'workspace.json',
+        file_type: fileType.value
+      },
+      getStoredAccessToken() || undefined
+    );
+
+    const result = await classifyRoutingMessage({
+      category: resolved.resolved_category,
+      channel: resolved.resolved_channel,
       text: messageText.value,
       use_ai: classifierMode.value === 'ai',
-      ai_endpoint: classifierMode.value === 'ai' ? aiEndpoint.value : undefined,
-      api_key: classifierMode.value === 'ai' ? apiKey.value : undefined
+      file_name: 'workspace.json',
+      file_type: fileType.value
     });
+
+    classificationResult.value = {
+      ...result,
+      resolved
+    };
   } catch (error: any) {
     classificationResult.value = {
       matched: false,
@@ -59,10 +104,49 @@ async function runClassifier() {
   }
 }
 
-onMounted(() => {
-  aiEndpoint.value = `${getTokenflowApiUrl()}/v1/chat/completions`;
-  loadRules();
-});
+function useRuleAsDraft(rule: any) {
+  editingRuleId.value = rule.id;
+  draftRule.value = {
+    name: rule.name,
+    category: rule.category,
+    channel: rule.channel,
+    matcher_type: rule.matcher_type,
+    matcher_config: rule.matcher_config || { keywords: [] },
+    action_config: rule.action_config || {},
+    classifier_mode: rule.classifier_mode,
+    priority: rule.priority,
+    enabled: rule.enabled,
+    is_public: rule.is_public
+  };
+  matcherKeywordsText.value = (rule.matcher_config?.keywords || []).join('\n');
+  actionConfigText.value = JSON.stringify(rule.action_config || {}, null, 2);
+}
+
+async function submitRule() {
+  savingRule.value = true;
+  try {
+    draftRule.value.matcher_config = {
+      keywords: matcherKeywordsText.value.split('\n').map(item => item.trim()).filter(Boolean)
+    };
+    draftRule.value.action_config = JSON.parse(actionConfigText.value || '{}');
+    const token = getStoredAccessToken() || undefined;
+    if (editingRuleId.value) {
+      await updateRoutingRule(editingRuleId.value, draftRule.value, token);
+      window.$message?.success(t('路由规则已更新', 'Routing rule updated'));
+    } else {
+      await saveRoutingRule(draftRule.value, token);
+      window.$message?.success(t('路由规则已创建', 'Routing rule created'));
+    }
+    editingRuleId.value = null;
+    await loadRules();
+  } catch (error: any) {
+    window.$message?.error(error?.message || t('保存规则失败', 'Failed to save rule'));
+  } finally {
+    savingRule.value = false;
+  }
+}
+
+onMounted(loadRules);
 </script>
 
 <template>
@@ -70,17 +154,25 @@ onMounted(() => {
     <div class="hero-card">
       <div>
         <div class="hero-kicker">Routing Center</div>
-        <div class="hero-title">{{ isZh ? '渠道规则与分类器' : 'Channel Rules And Classifiers' }}</div>
-        <div class="hero-desc">{{ isZh ? '为指定分类与接收渠道编排规则，并在规则分类器与 AI 分类器之间切换测试。' : 'Bind category-specific channels to rule lists, then verify them with either a rule engine or an AI classifier.' }}</div>
+        <div class="hero-title">{{ t('路由规则与分类控制台', 'Routing Rules And Classification Console') }}</div>
+        <div class="hero-desc">
+          {{ t('修复后的路由页会同时展示规则概览、上下文解析结果、分类测试，以及个人路由规则的新建与更新。', 'The routing page now shows rule summaries, resolved routing context, classifier tests, and personal rule creation/update.') }}
+        </div>
       </div>
-      <NTag type="info" round>{{ isZh ? '规则' : 'Rules' }} {{ rules.length }}</NTag>
+      <div class="hero-stats">
+        <NTag round type="info">{{ t('规则', 'Rules') }} {{ summary.rule_count }}</NTag>
+        <NTag round type="success">{{ t('启用', 'Enabled') }} {{ summary.enabled_count }}</NTag>
+      </div>
     </div>
 
     <NGrid :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
       <NGi span="24 s:24 m:14">
         <NCard :bordered="false" class="panel-card">
-          <template #header>{{ isZh ? '规则列表' : 'Rule Catalog' }}</template>
+          <template #header>{{ t('规则目录', 'Rule Catalog') }}</template>
           <NSpin :show="loading">
+            <div class="summary-row">
+              <NTag v-for="item in summary.categories" :key="item" round>{{ item }}</NTag>
+            </div>
             <div class="rule-groups">
               <div v-for="group in groupedRules" :key="group.category" class="rule-group">
                 <div class="group-head">
@@ -88,16 +180,16 @@ onMounted(() => {
                   <NTag round>{{ group.items.length }}</NTag>
                 </div>
                 <div v-if="group.items.length" class="rule-list">
-                  <div v-for="rule in group.items" :key="rule.id" class="rule-card">
+                  <div v-for="rule in group.items" :key="rule.id" class="rule-card" @click="useRuleAsDraft(rule)">
                     <div class="rule-title">{{ rule.name }}</div>
-                    <div class="rule-meta">{{ isZh ? '渠道' : 'Channel' }} {{ rule.channel }} - {{ isZh ? '优先级' : 'Priority' }} {{ rule.priority }}</div>
+                    <div class="rule-meta">{{ t('渠道', 'Channel') }} {{ rule.channel }} · {{ t('优先级', 'Priority') }} {{ rule.priority }}</div>
                     <div class="rule-keywords">
                       <NTag v-for="keyword in rule.matcher_config?.keywords || []" :key="keyword" size="small" round>{{ keyword }}</NTag>
                     </div>
-                    <div class="rule-target">{{ isZh ? '目标' : 'Target' }} {{ rule.action_config?.target || 'unassigned' }}</div>
+                    <div class="rule-target">{{ t('目标', 'Target') }} {{ rule.action_config?.target || 'unassigned' }}</div>
                   </div>
                 </div>
-                <NEmpty v-else size="small" :description="isZh ? '当前分类暂无规则' : 'No rules in this category'" />
+                <NEmpty v-else size="small" :description="t('当前分类暂无规则', 'No rules in this category')" />
               </div>
             </div>
           </NSpin>
@@ -106,44 +198,80 @@ onMounted(() => {
 
       <NGi span="24 s:24 m:10">
         <NCard :bordered="false" class="panel-card">
-          <template #header>{{ isZh ? '分类测试' : 'Classifier Test' }}</template>
+          <template #header>{{ t('路由测试', 'Routing Test') }}</template>
 
           <NForm label-placement="top">
-            <NFormItem :label="isZh ? '分类' : 'Category'">
-              <NSelect v-model:value="selectedCategory" :options="categories.map(item => ({ label: item, value: item }))" />
+            <NFormItem :label="t('分类', 'Category')">
+              <NSelect v-model:value="selectedCategory" :options="summary.categories.map(item => ({ label: item, value: item }))" />
             </NFormItem>
-            <NFormItem :label="isZh ? '渠道' : 'Channel'">
-              <NSelect v-model:value="selectedChannel" :options="channels.map(item => ({ label: item, value: item }))" />
+            <NFormItem :label="t('渠道', 'Channel')">
+              <NSelect v-model:value="selectedChannel" :options="summary.channels.map(item => ({ label: item, value: item }))" />
             </NFormItem>
-            <NFormItem :label="isZh ? '分类器' : 'Classifier'">
+            <NFormItem :label="t('文件类型', 'File Type')">
+              <NSelect
+                v-model:value="fileType"
+                :options="['workspace', 'module', 'workflow', 'pdf', 'image', 'audio'].map(item => ({ label: item, value: item }))"
+              />
+            </NFormItem>
+            <NFormItem :label="t('分类器', 'Classifier')">
               <NSegmented v-model:value="classifierMode" :options="[{ label: 'Rule', value: 'rule' }, { label: 'AI', value: 'ai' }]" />
             </NFormItem>
-            <NFormItem v-if="classifierMode === 'ai'" :label="isZh ? 'AI 接口地址' : 'AI Endpoint'">
-              <NInput v-model:value="aiEndpoint" placeholder="https://.../v1/chat/completions" />
-            </NFormItem>
-            <NFormItem v-if="classifierMode === 'ai'" label="API Key">
-              <NInput v-model:value="apiKey" type="password" show-password-on="click" />
-            </NFormItem>
-            <NFormItem :label="isZh ? '输入内容' : 'Input'">
+            <NFormItem :label="t('输入内容', 'Input')">
               <NInput v-model:value="messageText" type="textarea" :autosize="{ minRows: 5, maxRows: 8 }" />
             </NFormItem>
-            <NButton type="primary" :loading="classifyLoading" @click="runClassifier">{{ isZh ? '运行分类' : 'Run Classifier' }}</NButton>
+            <NButton type="primary" :loading="classifyLoading" @click="runClassifier">{{ t('运行分类', 'Run Classifier') }}</NButton>
           </NForm>
 
           <div class="result-card" :class="{ matched: classificationResult?.matched, miss: classificationResult && !classificationResult?.matched }">
-            <div class="result-title">{{ isZh ? '结果' : 'Result' }}</div>
+            <div class="result-title">{{ t('结果', 'Result') }}</div>
             <div v-if="classificationResult" class="result-body">
-              <div>{{ isZh ? '模式' : 'Mode' }}: {{ classificationResult.mode }}</div>
-              <div>{{ isZh ? '命中' : 'Matched' }}: {{ classificationResult.matched ? (isZh ? '是' : 'Yes') : (isZh ? '否' : 'No') }}</div>
-              <div>{{ isZh ? '规则' : 'Rule' }}: {{ classificationResult.rule_name || '-' }}</div>
-              <div>{{ isZh ? '原因' : 'Reason' }}: {{ classificationResult.reason || '-' }}</div>
-              <div>{{ isZh ? '目标' : 'Target' }}: {{ classificationResult.target?.target || '-' }}</div>
+              <div>{{ t('模式', 'Mode') }}: {{ classificationResult.mode }}</div>
+              <div>{{ t('命中', 'Matched') }}: {{ classificationResult.matched ? t('是', 'Yes') : t('否', 'No') }}</div>
+              <div>{{ t('规则', 'Rule') }}: {{ classificationResult.rule_name || '-' }}</div>
+              <div>{{ t('原因', 'Reason') }}: {{ classificationResult.reason || '-' }}</div>
+              <div>{{ t('解析分类', 'Resolved Category') }}: {{ classificationResult.resolved?.resolved_category || classificationResult.resolved_category || '-' }}</div>
+              <div>{{ t('解析渠道', 'Resolved Channel') }}: {{ classificationResult.resolved?.resolved_channel || classificationResult.resolved_channel || '-' }}</div>
+              <div>{{ t('路由类型', 'Route Kind') }}: {{ classificationResult.route_kind || classificationResult.resolved?.route_kind || '-' }}</div>
             </div>
-            <NEmpty v-else size="small" :description="isZh ? '运行后显示分类结果' : 'Run the classifier to see a result'" />
+            <NEmpty v-else size="small" :description="t('运行分类后显示结果', 'Run the classifier to see a result')" />
           </div>
         </NCard>
       </NGi>
     </NGrid>
+
+    <NCard :bordered="false" class="panel-card">
+      <template #header>{{ editingRuleId ? t('编辑个人规则', 'Edit Personal Rule') : t('新建个人规则', 'Create Personal Rule') }}</template>
+      <NGrid :x-gap="16" :y-gap="16" responsive="screen" item-responsive>
+        <NGi span="24 s:24 m:8">
+          <NForm label-placement="top">
+            <NFormItem :label="t('规则名称', 'Rule Name')">
+              <NInput v-model:value="draftRule.name" />
+            </NFormItem>
+            <NFormItem :label="t('分类', 'Category')">
+              <NInput v-model:value="draftRule.category" />
+            </NFormItem>
+            <NFormItem :label="t('渠道', 'Channel')">
+              <NInput v-model:value="draftRule.channel" />
+            </NFormItem>
+          </NForm>
+        </NGi>
+        <NGi span="24 s:24 m:8">
+          <NForm label-placement="top">
+            <NFormItem :label="t('关键词列表 JSON', 'Keyword JSON')">
+              <NInput v-model:value="matcherKeywordsText" type="textarea" :autosize="{ minRows: 5, maxRows: 8 }" />
+            </NFormItem>
+          </NForm>
+        </NGi>
+        <NGi span="24 s:24 m:8">
+          <NForm label-placement="top">
+            <NFormItem :label="t('动作配置 JSON', 'Action JSON')">
+              <NInput v-model:value="actionConfigText" type="textarea" :autosize="{ minRows: 5, maxRows: 8 }" />
+            </NFormItem>
+            <NButton type="primary" :loading="savingRule" @click="submitRule">{{ t('保存规则', 'Save Rule') }}</NButton>
+          </NForm>
+        </NGi>
+      </NGrid>
+    </NCard>
   </div>
 </template>
 
@@ -192,10 +320,17 @@ onMounted(() => {
   margin: 8px 0;
 }
 
+.hero-stats,
+.summary-row,
 .rule-groups,
 .rule-list {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
   gap: 12px;
+}
+
+.rule-groups {
+  display: grid;
 }
 
 .group-head {
@@ -208,6 +343,10 @@ onMounted(() => {
 .rule-card,
 .result-card {
   padding: 14px;
+}
+
+.rule-card {
+  cursor: pointer;
 }
 
 .rule-keywords {

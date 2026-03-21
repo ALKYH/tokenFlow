@@ -21,6 +21,32 @@ class RoutingRuleRead(BaseModel):
     updated_at: datetime | None = None
 
 
+class RoutingRuleCreate(BaseModel):
+    name: str
+    category: str = 'general'
+    channel: str = 'dashboard'
+    matcher_type: str = 'keyword'
+    matcher_config: dict[str, Any] = Field(default_factory=dict)
+    action_config: dict[str, Any] = Field(default_factory=dict)
+    classifier_mode: str = 'rule'
+    priority: int = 100
+    enabled: bool = True
+    is_public: bool = False
+
+
+class RoutingRuleUpdate(BaseModel):
+    name: str | None = None
+    category: str | None = None
+    channel: str | None = None
+    matcher_type: str | None = None
+    matcher_config: dict[str, Any] | None = None
+    action_config: dict[str, Any] | None = None
+    classifier_mode: str | None = None
+    priority: int | None = None
+    enabled: bool | None = None
+    is_public: bool | None = None
+
+
 class RoutingClassifyRequest(BaseModel):
     category: str | None = None
     channel: str | None = None
@@ -53,3 +79,10 @@ class RoutingClassifyResponse(BaseModel):
     resolved_channel: str | None = None
     selected_api: dict[str, Any] = Field(default_factory=dict)
     route_kind: str = 'manual'
+
+
+class RoutingSummary(BaseModel):
+    categories: list[str] = Field(default_factory=list)
+    channels: list[str] = Field(default_factory=list)
+    rule_count: int = 0
+    enabled_count: int = 0

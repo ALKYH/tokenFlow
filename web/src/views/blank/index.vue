@@ -2,6 +2,7 @@
 
 <script setup lang="ts">
     import { ref, reactive, onMounted, onBeforeUnmount, computed, watch } from 'vue';
+    import { useRoute } from 'vue-router';
     import type { CSSProperties } from 'vue';
     import { edgePath, NODE_W, headerHeight, rowHeight, BODY_PADDING } from './editor-core';
     import useEditorInteractions from './useEditorInteractions';
@@ -21,8 +22,17 @@
     } from './node-catalog';
     import { isBuiltinNode, runBuiltinNode } from './node-runtime';
     import { KNOWLEDGE_NODE_PRESETS, createKnowledgeNode, isKnowledgeNode } from './knowledge-pipeline';
+    import {
+      consumePendingWorkspaceImport,
+      fetchMyPluginLibrary,
+      fetchWorkspaceById,
+      getStoredAccessToken,
+      loadWorkspaceSnapshots,
+      uploadPlugin
+    } from '@/service/api';
 
     const areaRef = ref<HTMLElement | null>(null);
+    const route = useRoute();
     const nodes = reactive<Node[]>([]);
     const folders = reactive<Array<any>>([]);
     const edges = reactive<Edge[]>([]);
@@ -128,6 +138,7 @@
       { key: 'EMBEDDING_API_KEY', value: '', secret: true }
     ]);
     const savedNodeTemplates = ref<any[]>([]);
+    const cloudModuleCount = ref(0);
     const nodeTemplateStorageKey = 'tokenflow.local-node-templates.v1';
     const workspaceStorageKey = 'tokenflow.workspace.modules.v1';
     let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1000,26 +1011,28 @@
       }
     }
 
-    onMounted(() => {
+    onMounted(async () => {
       window.addEventListener('click', onDocClick);
       window.addEventListener('keydown', onDocKey);
       window.addEventListener('contextmenu', onGlobalContextMenu);
-      // preset graph: two constants -> multiply -> print
-      const n1 = { id: `node_${nodeSeq++}`, x: 120, y: 120, label: 'Const A', category: 'const', inputs: [], outputs: ['value'], inputTypes: [], outputTypes: ['Any'], code: 'res = 2', lastResult: null, isInit: true };
-      const n2 = { id: `node_${nodeSeq++}`, x: 120, y: 240, label: 'Const B', category: 'const', inputs: [], outputs: ['value'], inputTypes: [], outputTypes: ['Any'], code: 'res = 3', lastResult: null, isInit: true };
-      const mul = { id: `node_${nodeSeq++}`, x: 380, y: 180, label: 'Multiply', category: 'mul', inputs: ['a','b'], outputs: ['res'], inputTypes: ['Any','Any'], outputTypes: ['Any'], code: 'res = a * b', lastResult: null };
-      const pr = { id: `node_${nodeSeq++}`, x: 620, y: 180, label: 'Print', category: 'print', inputs: ['in'], outputs: [], inputTypes: ['Any'], outputTypes: [], code: 'print(res)', lastResult: null };
-      nodes.push(n1, n2, mul, pr);
-      edges.push({ id: `edge_${nodeSeq++}_1`, from: { nodeId: n1.id, portIndex: 0 }, to: { nodeId: mul.id, portIndex: 0 } });
-      edges.push({ id: `edge_${nodeSeq++}_2`, from: { nodeId: n2.id, portIndex: 0 }, to: { nodeId: mul.id, portIndex: 1 } });
-      edges.push({ id: `edge_${nodeSeq++}_3`, from: { nodeId: mul.id, portIndex: 0 }, to: { nodeId: pr.id, portIndex: 0 } });
-      // example folder containing multiply and print
-      folders.push({ id: `folder_1`, x: 340, y: 160, w: 360, h: 160, label: '示例分组', children: [mul.id, pr.id] });
+      const restored = await restoreInitialWorkspace();
+      if (!restored) {
+        const n1 = { id: `node_${nodeSeq++}`, x: 120, y: 120, label: 'Const A', category: 'const', inputs: [], outputs: ['value'], inputTypes: [], outputTypes: ['Any'], code: 'res = 2', lastResult: null, isInit: true };
+        const n2 = { id: `node_${nodeSeq++}`, x: 120, y: 240, label: 'Const B', category: 'const', inputs: [], outputs: ['value'], inputTypes: [], outputTypes: ['Any'], code: 'res = 3', lastResult: null, isInit: true };
+        const mul = { id: `node_${nodeSeq++}`, x: 380, y: 180, label: 'Multiply', category: 'mul', inputs: ['a','b'], outputs: ['res'], inputTypes: ['Any','Any'], outputTypes: ['Any'], code: 'res = a * b', lastResult: null };
+        const pr = { id: `node_${nodeSeq++}`, x: 620, y: 180, label: 'Print', category: 'print', inputs: ['in'], outputs: [], inputTypes: ['Any'], outputTypes: [], code: 'print(res)', lastResult: null };
+        nodes.push(n1, n2, mul, pr);
+        edges.push({ id: `edge_${nodeSeq++}_1`, from: { nodeId: n1.id, portIndex: 0 }, to: { nodeId: mul.id, portIndex: 0 } });
+        edges.push({ id: `edge_${nodeSeq++}_2`, from: { nodeId: n2.id, portIndex: 0 }, to: { nodeId: mul.id, portIndex: 1 } });
+        edges.push({ id: `edge_${nodeSeq++}_3`, from: { nodeId: mul.id, portIndex: 0 }, to: { nodeId: pr.id, portIndex: 0 } });
+        folders.push({ id: `folder_1`, x: 340, y: 160, w: 360, h: 160, label: '示例分组', children: [mul.id, pr.id] });
+      }
       // load pyodide in background
       loadPyodideAndInit().catch(e => logDebug('loadPyodide failed', e?.toString ? e.toString() : e));
       // init node module list
       loadNodeTemplates();
       rebuildNodeModules();
+      refreshCloudModuleCount();
     });
 
     watch(nodes, () => queuePersistWorkspace(), { deep: true });
@@ -1320,6 +1333,14 @@
       };
     }
 
+    function slugify(value: string) {
+      return String(value || 'tokenflow-module')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || `tokenflow-module-${Date.now()}`;
+    }
+
     function persistWorkspace() {
       try {
         const current = serializeWorkspace();
@@ -1452,6 +1473,128 @@
         };
         reader.readAsText(file);
       } catch (e2) { logDebug('handleImportNodeTemplateFile error', e2); }
+    }
+
+    function loadWorkspaceSnapshot(snapshot: any) {
+      if (!snapshot) return;
+      const graph = snapshot.graph || snapshot.content?.graph || {};
+      nodes.splice(0, nodes.length, ...JSON.parse(JSON.stringify(graph.nodes || [])));
+      edges.splice(0, edges.length, ...JSON.parse(JSON.stringify(graph.edges || [])));
+      folders.splice(0, folders.length, ...JSON.parse(JSON.stringify(graph.folders || [])));
+      envVars.splice(0, envVars.length, ...JSON.parse(JSON.stringify(graph.envVars || [])));
+      moduleMeta.name = snapshot.name || snapshot.content?.name || 'TokenFlow Workspace';
+      moduleMeta.description = snapshot.description || snapshot.content?.description || '';
+      moduleMeta.requires = snapshot.requires || snapshot.content?.requires || '';
+      selectedIds.value = [];
+      nodeSeq = Math.max(1, nodes.length + 1);
+      rebuildNodeModules();
+    }
+
+    async function refreshCloudModuleCount() {
+      const token = getStoredAccessToken();
+      if (!token) return;
+      try {
+        const items = await fetchMyPluginLibrary({ plugin_type: 'module' }, token);
+        cloudModuleCount.value = items.length;
+      } catch (e) {
+        logDebug('refreshCloudModuleCount error', e?.toString ? e.toString() : e);
+      }
+    }
+
+    async function saveWorkspaceToPersonalModule() {
+      const token = getStoredAccessToken();
+      if (!token) {
+        window.$message?.warning('请先登录后再保存到个人模块库');
+        return;
+      }
+      try {
+        await uploadPlugin({
+          name: moduleMeta.name || 'TokenFlow Workspace',
+          slug: `${slugify(moduleMeta.name || 'workspace')}-${Date.now()}`,
+          summary: moduleMeta.description || 'Saved from workspace sidebar',
+          category: 'workspace',
+          plugin_type: 'module',
+          author_name: 'TokenFlow User',
+          tags: ['workspace', 'personal-module'],
+          source: { channel: 'workspace-sidebar', mode: 'personal-module' },
+          route_info: { saved_from: 'left-sidebar', requires: moduleMeta.requires || '' },
+          library_kind: 'personal',
+          workspace_snapshot: serializeWorkspace(),
+          is_public: false
+        }, token);
+        window.$message?.success('已保存到个人模块库');
+        refreshCloudModuleCount();
+      } catch (e: any) {
+        window.$message?.error(e?.message || '保存到个人模块库失败');
+      }
+    }
+
+    async function uploadSelectedNodeTemplate() {
+      const token = getStoredAccessToken();
+      const node = selectedNode.value;
+      if (!token) {
+        window.$message?.warning('请先登录后再上传到个人节点库');
+        return;
+      }
+      if (!node) return;
+      try {
+        await uploadPlugin({
+          name: node.label || node.id,
+          slug: `${slugify(node.label || node.id)}-${Date.now()}`,
+          summary: `Node template uploaded from ${moduleMeta.name || 'workspace'}`,
+          category: node.category || 'custom',
+          plugin_type: 'node-template',
+          author_name: 'TokenFlow User',
+          tags: [node.category || 'custom', 'personal-node'],
+          source: { channel: 'node-inspector', workspace: moduleMeta.name || '' },
+          route_info: { node_id: node.id, node_kind: node.meta?.nodeKind || 'custom' },
+          library_kind: 'personal',
+          node_template_snapshot: serializeNodeTemplate(node),
+          is_public: false
+        }, token);
+        window.$message?.success('已上传到个人节点库');
+      } catch (e: any) {
+        window.$message?.error(e?.message || '上传节点模板失败');
+      }
+    }
+
+    async function restoreInitialWorkspace() {
+      const pending = consumePendingWorkspaceImport();
+      if (pending && route.query.pending === '1') {
+        loadWorkspaceSnapshot(pending);
+        return true;
+      }
+
+      if (route.query.module && route.query.source === 'local') {
+        const target = loadWorkspaceSnapshots().find(item => item.id === route.query.module);
+        if (target) {
+          loadWorkspaceSnapshot(target);
+          return true;
+        }
+      }
+
+      if (route.query.cloudPlugin) {
+        const token = getStoredAccessToken();
+        if (!token) return false;
+        const list = await fetchMyPluginLibrary({ plugin_type: 'module' }, token);
+        const target = list.find(item => String(item.id) === String(route.query.cloudPlugin));
+        if (target?.workspace_snapshot) {
+          loadWorkspaceSnapshot(target.workspace_snapshot);
+          return true;
+        }
+      }
+
+      if (route.query.workspaceId) {
+        const token = getStoredAccessToken();
+        if (!token) return false;
+        const workspace = await fetchWorkspaceById(Number(route.query.workspaceId), token);
+        if (workspace?.content) {
+          loadWorkspaceSnapshot(workspace.content);
+          return true;
+        }
+      }
+
+      return false;
     }
 
     // parse exported python and restore nodes + edges
@@ -2252,6 +2395,7 @@
         :saved-node-templates="savedNodeTemplates"
         :workflow-templates="WORKFLOW_TEMPLATES"
         :workflow-template-groups="WORKFLOW_TEMPLATE_GROUPS"
+        :cloud-module-count="cloudModuleCount"
         @toggle="leftCollapsed = !leftCollapsed"
         @add-preset="addPresetFromPanel"
         @apply-workflow-template="applyWorkflowTemplate"
@@ -2261,6 +2405,7 @@
         @update-env-var="updateEnvVar"
         @import-saved-template="importSavedTemplate"
         @delete-saved-template="deleteSavedTemplate"
+        @save-personal-module="saveWorkspaceToPersonalModule"
       />
 
       <div ref="areaRef" class="editor-area" style="flex:1;position:relative;border-radius:6px;overflow:visible" @pointerdown="onPointerDownArea">
@@ -2411,6 +2556,7 @@
         @attach-node-files="handleAttachNodeFiles"
         @clear-node-files="handleClearNodeFiles"
         @save-node-template="saveSelectedNodeTemplate"
+        @upload-node-template="uploadSelectedNodeTemplate"
         @update-node-note="handleUpdateNodeNote"
         @update-folder-label="handleUpdateFolderLabel"
         @update-folder-comment="handleUpdateFolderComment"

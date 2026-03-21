@@ -11,6 +11,7 @@ const props = defineProps<{
   savedNodeTemplates: any[]
   workflowTemplates: any[]
   workflowTemplateGroups: Array<{ key: string; label: string }>
+  cloudModuleCount?: number
 }>();
 
 const emit = defineEmits<{
@@ -23,6 +24,7 @@ const emit = defineEmits<{
   (e: 'updateEnvVar', payload: { index: number; field: 'key' | 'value' | 'secret'; value: string | boolean }): void
   (e: 'importSavedTemplate', payload: any): void
   (e: 'deleteSavedTemplate', payload: string): void
+  (e: 'savePersonalModule'): void
 }>();
 
 const searchText = ref('');
@@ -48,23 +50,11 @@ const groupedTemplates = computed(() =>
   }))
 );
 
-const nodeStats = computed(() => {
-  const categories = props.categories || [];
-  const knowledge = categories.find(item => item.key === 'knowledge');
-  return {
-    categoryCount: categories.length,
-    knowledgeCount: knowledge?.items?.length || 0,
-    localTemplateCount: props.savedNodeTemplates.length
-  };
-});
-
-function categoryIcon(key: string) {
-  if (key === 'knowledge') return 'solar:database-linear';
-  if (key === 'tools') return 'solar:widget-add-linear';
-  if (key === 'llm') return 'solar:chat-round-dots-linear';
-  if (key === 'components') return 'solar:layers-linear';
-  return 'solar:code-2-linear';
-}
+const nodeStats = computed(() => ({
+  categoryCount: (props.categories || []).length,
+  localTemplateCount: props.savedNodeTemplates.length,
+  cloudModuleCount: props.cloudModuleCount || 0
+}));
 </script>
 
 <template>
@@ -79,29 +69,34 @@ function categoryIcon(key: string) {
           <div class="sidebar-kicker">Workspace</div>
           <div class="sidebar-title">节点资源台</div>
         </div>
-        <NTag size="small" round type="info">{{ nodeStats.localTemplateCount }} 本地模板</NTag>
+        <NTag size="small" round type="info">{{ nodeStats.localTemplateCount }} 本地节点</NTag>
+      </div>
+
+      <div class="top-actions">
+        <NButton type="primary" block @click="emit('savePersonalModule')">
+          <template #icon><SvgIcon icon="solar:cloud-upload-linear" /></template>
+          保存到个人模块
+        </NButton>
       </div>
 
       <div class="overview-cards">
         <div class="overview-card">
-          <div class="overview-label">节点分类</div>
+          <div class="overview-label">分类</div>
           <div class="overview-value">{{ nodeStats.categoryCount }}</div>
         </div>
-        <div class="overview-card highlight">
-          <div class="overview-label">知识库节点</div>
-          <div class="overview-value">{{ nodeStats.knowledgeCount }}</div>
+        <div class="overview-card">
+          <div class="overview-label">云端模块</div>
+          <div class="overview-value">{{ nodeStats.cloudModuleCount }}</div>
         </div>
       </div>
 
       <NTabs v-model:value="activeTab" type="segment" animated>
         <NTabPane name="library" tab="节点">
-          <NInput v-model:value="searchText" clearable placeholder="搜索节点、知识库能力或组件" />
+          <NInput v-model:value="searchText" clearable placeholder="搜索节点、工具或 LLM 能力" />
 
           <div class="quick-actions">
-            <NButton secondary block @click="emit('addPreset', { key: 'note', label: '注释便签', desc: '用于记录设计说明与协作备注' })">
-              <template #icon>
-                <SvgIcon icon="solar:notes-linear" />
-              </template>
+            <NButton secondary block @click="emit('addPreset', { key: 'note', label: '注释便签', desc: '记录流程说明与协作备注' })">
+              <template #icon><SvgIcon icon="solar:notes-linear" /></template>
               新增便签
             </NButton>
           </div>
@@ -110,13 +105,6 @@ function categoryIcon(key: string) {
             <div class="section-title">节点库</div>
             <NCollapse :default-expanded-names="filteredCategories.map((item: any) => item.key)">
               <NCollapseItem v-for="cat in filteredCategories" :key="cat.key" :title="cat.label" :name="cat.key">
-                <template #header-extra>
-                  <div class="collapse-extra">
-                    <SvgIcon :icon="categoryIcon(cat.key)" />
-                    <span>{{ cat.items?.length || 0 }}</span>
-                  </div>
-                </template>
-
                 <div class="item-grid">
                   <button v-for="item in cat.items" :key="item.key" class="library-card" @click="emit('addPreset', item)">
                     <span class="library-icon" :style="{ background: nodeCategoryColor(item.key) }"></span>
@@ -171,9 +159,7 @@ function categoryIcon(key: string) {
                     ]"
                     @select="key => key === 'add' ? emit('importSavedTemplate', template) : emit('deleteSavedTemplate', template.id)"
                   >
-                    <NButton text>
-                      <SvgIcon icon="solar:menu-dots-linear" />
-                    </NButton>
+                    <NButton text><SvgIcon icon="solar:menu-dots-linear" /></NButton>
                   </NDropdown>
                 </div>
                 <div class="template-desc">{{ template.description || '未填写描述' }}</div>
@@ -197,7 +183,7 @@ function categoryIcon(key: string) {
                   @update:value="value => emit('updateProjectConfig', { field: 'description', value })"
                 />
               </NFormItem>
-              <NFormItem label="依赖包 / 运行时">
+              <NFormItem label="依赖 / 运行时">
                 <NInput :value="projectConfig.requires" @update:value="value => emit('updateProjectConfig', { field: 'requires', value })" />
               </NFormItem>
             </NForm>
@@ -250,9 +236,7 @@ function categoryIcon(key: string) {
   overflow: visible;
 }
 
-.sidebar.left {
-  left: 8px;
-}
+.sidebar.left { left: 8px; }
 
 .sidebar-toggle {
   cursor: pointer;
@@ -268,207 +252,45 @@ function categoryIcon(key: string) {
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
 }
 
-.sidebar-content {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  height: 100%;
-  overflow: auto;
-}
-
-.sidebar-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.sidebar-kicker {
-  font-size: 12px;
-  color: #64748b;
-}
-
-.sidebar-title {
-  font-size: 18px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.overview-cards {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-
-.overview-card {
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  background: rgba(255, 255, 255, 0.8);
-  border-radius: 16px;
-  padding: 12px;
-}
-
-.overview-card.highlight {
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.1), rgba(16, 185, 129, 0.08));
-}
-
-.overview-label {
-  font-size: 12px;
-  color: #64748b;
-}
-
-.overview-value {
-  margin-top: 6px;
-  font-size: 24px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.quick-actions {
-  margin: 12px 0;
-}
-
-.section-block {
-  margin-top: 12px;
-}
-
-.section-title,
-.section-subtitle {
-  font-size: 13px;
-  font-weight: 700;
-  color: #334155;
-  margin-bottom: 10px;
-}
-
-.section-subtitle {
-  margin-top: 8px;
-}
-
-.collapse-extra {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: #64748b;
-  font-size: 12px;
-}
-
-.row-between {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.item-grid,
-.template-list,
-.env-list,
-.template-groups {
-  display: grid;
-  gap: 10px;
-}
-
-.library-card,
-.template-card,
-.env-row {
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  background: rgba(255, 255, 255, 0.78);
-  border-radius: 16px;
-  padding: 12px;
-}
-
-.library-card {
-  display: grid;
-  grid-template-columns: 14px 1fr;
-  gap: 10px;
-  align-items: start;
-  width: 100%;
-  text-align: left;
-  cursor: pointer;
-  transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
-}
-
-.library-card:hover {
-  transform: translateY(-1px);
-  border-color: rgba(59, 130, 246, 0.24);
-  box-shadow: 0 16px 30px rgba(37, 99, 235, 0.08);
-}
-
-.library-icon {
-  width: 14px;
-  height: 14px;
-  border-radius: 999px;
-  margin-top: 4px;
-}
-
-.library-main {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.library-name,
-.template-name {
-  font-size: 14px;
-  font-weight: 700;
-  color: #0f172a;
-}
-
-.library-desc,
-.template-desc,
-.template-meta {
-  font-size: 12px;
-  color: #64748b;
-  line-height: 1.55;
-}
-
-.template-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.env-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr auto auto;
-  gap: 8px;
-  align-items: center;
-}
+.sidebar-content { display: flex; flex-direction: column; gap: 12px; height: 100%; overflow: auto; }
+.sidebar-header, .row-between, .template-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.sidebar-kicker, .overview-label, .library-desc, .template-desc, .template-meta, .section-subtitle { font-size: 12px; color: #64748b; }
+.sidebar-title, .overview-value, .library-name, .template-name, .section-title { color: #0f172a; font-weight: 700; }
+.sidebar-title { font-size: 18px; }
+.top-actions, .template-groups, .template-list, .env-list, .item-grid { display: grid; gap: 10px; }
+.overview-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.overview-card, .library-card, .template-card, .env-row { border: 1px solid rgba(148, 163, 184, 0.18); background: rgba(255, 255, 255, 0.78); border-radius: 16px; padding: 12px; }
+.library-card { display: grid; grid-template-columns: 14px 1fr; gap: 10px; text-align: left; width: 100%; }
+.library-icon { width: 14px; height: 14px; border-radius: 999px; margin-top: 4px; }
+.library-main { display: flex; flex-direction: column; gap: 4px; }
+.env-row { display: grid; grid-template-columns: 1fr 1fr auto auto; gap: 8px; align-items: center; }
 
 @media (prefers-color-scheme: dark) {
-  .sidebar {
-    background: linear-gradient(180deg, rgba(15, 23, 42, 0.9), rgba(15, 23, 42, 0.76));
-    border-color: rgba(71, 85, 105, 0.34);
-    box-shadow: 0 24px 60px rgba(2, 6, 23, 0.34);
-  }
-
+  .sidebar,
   .sidebar-toggle,
   .overview-card,
   .library-card,
   .template-card,
   .env-row {
-    background: rgba(15, 23, 42, 0.72);
+    background: rgba(15, 23, 42, 0.78);
     border-color: rgba(71, 85, 105, 0.3);
     color: #e2e8f0;
-  }
-
-  .overview-card.highlight {
-    background: linear-gradient(135deg, rgba(37, 99, 235, 0.18), rgba(20, 184, 166, 0.12));
   }
 
   .sidebar-title,
   .overview-value,
   .library-name,
-  .template-name {
+  .template-name,
+  .section-title {
     color: #e2e8f0;
   }
 
   .sidebar-kicker,
   .overview-label,
-  .section-title,
-  .section-subtitle,
-  .collapse-extra,
   .library-desc,
   .template-desc,
-  .template-meta {
+  .template-meta,
+  .section-subtitle {
     color: #94a3b8;
   }
 }

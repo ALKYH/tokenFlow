@@ -12,7 +12,9 @@ class InboxMessage(Base):
     body = Column(Text, nullable=False, default='')
     category = Column(String(80), nullable=False, default='system')
     channel = Column(String(80), nullable=False, default='dashboard')
+    source = Column(String(120), nullable=False, default='system')
     is_read = Column(Boolean, nullable=False, default=False)
+    attachments = Column(JSON, nullable=False, default=list)
     extra = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
