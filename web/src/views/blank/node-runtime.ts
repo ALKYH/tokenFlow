@@ -154,13 +154,20 @@ export function createBuiltinNode(category: BuiltinNodeCategory, id: string, x: 
 }
 
 export async function runBuiltinNode(node: Node, inputs: any[], envEntries?: Array<{ key: string; value: string; secret?: boolean }>) {
+  const env = Object.fromEntries((envEntries || []).filter(item => item.key).map(item => [item.key, item.value]));
   if (isKnowledgeNode(node.category)) {
-    return runKnowledgeNode(node, inputs);
+    const resolvedNode = {
+      ...node,
+      meta: {
+        ...(node.meta || {}),
+        config: resolveEnvInObject(node.meta?.config || {}, env)
+      }
+    } as Node;
+    return runKnowledgeNode(resolvedNode, inputs);
   }
   if (!isCustomNode(node.category)) {
     throw new Error(`Unsupported builtin node: ${String(node.category)}`);
   }
-  const env = Object.fromEntries((envEntries || []).filter(item => item.key).map(item => [item.key, item.value]));
   const config = resolveEnvInObject(node.meta?.config || {}, env);
 
   if (node.category === 'file-read') return runFileRead(node, inputs);
@@ -262,7 +269,7 @@ async function runLlmChat(inputs: any[], config: Record<string, any>) {
   const data = await callModelApi(payload, config);
   return {
     type: 'llm-answer',
-    answer: extractModelText(data),
+    answer: extractModelText(data, config.responsePath),
     raw: data
   };
 }
@@ -276,7 +283,7 @@ async function runAgentTask(inputs: any[], config: Record<string, any>) {
   const data = await callModelApi(payload, config);
   return {
     type: 'agent-result',
-    result: extractModelText(data),
+    result: extractModelText(data, config.responsePath),
     raw: data
   };
 }
@@ -321,10 +328,23 @@ async function callModelApi(payload: Record<string, any>, config: Record<string,
   return response.json();
 }
 
-function extractModelText(data: any) {
-  if (typeof data?.output_text === 'string') return data.output_text;
-  if (Array.isArray(data?.choices) && typeof data.choices[0]?.message?.content === 'string') return data.choices[0].message.content;
-  if (Array.isArray(data?.content)) return data.content.map((item: any) => item?.text || '').join('\n').trim();
+function extractModelText(data: any, responsePath?: string) {
+  const selected = responsePath ? getValueByPath(data, String(responsePath)) : undefined;
+  const selectedText = normalizeModelText(selected);
+  if (selectedText) return selectedText;
+
+  const outputText = normalizeModelText(data?.output_text);
+  if (outputText) return outputText;
+
+  const choiceText = normalizeModelText(data?.choices?.[0]?.message?.content);
+  if (choiceText) return choiceText;
+
+  const contentText = normalizeModelText(data?.content);
+  if (contentText) return contentText;
+
+  const responseText = normalizeModelText(data?.output);
+  if (responseText) return responseText;
+
   return JSON.stringify(data, null, 2);
 }
 
@@ -359,4 +379,29 @@ function tryParseJson(text: string) {
   } catch {
     return null;
   }
+}
+
+function isPlainObject(value: any): value is Record<string, any> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function getValueByPath(source: any, rawPath: string) {
+  const path = String(rawPath || '').trim();
+  if (!path) return undefined;
+  return path.split('.').reduce((current, segment) => {
+    if (current == null) return undefined;
+    if (/^\d+$/.test(segment)) return current[Number(segment)];
+    return current[segment];
+  }, source);
+}
+
+function normalizeModelText(value: any): string {
+  if (typeof value === 'string') return value;
+  if (!value) return '';
+  if (Array.isArray(value)) {
+    return value.map(item => normalizeModelText(item)).filter(Boolean).join('\n').trim();
+  }
+  if (typeof value?.text === 'string') return value.text;
+  if (Array.isArray(value?.content)) return normalizeModelText(value.content);
+  return '';
 }

@@ -214,7 +214,7 @@ onMounted(loadRules);
               />
             </NFormItem>
             <NFormItem :label="t('分类器', 'Classifier')">
-              <NSegmented v-model:value="classifierMode" :options="[{ label: 'Rule', value: 'rule' }, { label: 'AI', value: 'ai' }]" />
+              <NSelect v-model:value="classifierMode" :options="[{ label: 'Rule', value: 'rule' }, { label: 'AI', value: 'ai' }]" />
             </NFormItem>
             <NFormItem :label="t('输入内容', 'Input')">
               <NInput v-model:value="messageText" type="textarea" :autosize="{ minRows: 5, maxRows: 8 }" />

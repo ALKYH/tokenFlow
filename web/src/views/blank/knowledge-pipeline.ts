@@ -379,7 +379,7 @@ async function runEmbeddingIndex(source: any, config: Record<string, any>) {
     fileMap.set(chunk.fileId, prev);
   });
 
-  return {
+  const index = {
     type: 'knowledge-index',
     provider: 'api-embedding',
     generatedAt: new Date().toISOString(),
@@ -388,6 +388,8 @@ async function runEmbeddingIndex(source: any, config: Record<string, any>) {
     chunks: indexedChunks,
     embeddingConfig: sanitizeEmbeddingConfig(config)
   } satisfies KnowledgeIndex;
+
+  return attachRuntimeEmbeddingConfig(index, config);
 }
 
 function runKeywordSearch(source: any, queryInput: any, config: Record<string, any>) {
@@ -439,7 +441,7 @@ async function runIndexSearch(indexInput: any, queryInput: any, config: Record<s
     throw new Error('索引检索节点需要来自 Embedding 节点的索引输入');
   }
 
-  const queryEmbedding = await resolveQueryEmbedding(queryInput, config, index.embeddingConfig || {});
+  const queryEmbedding = await resolveQueryEmbedding(queryInput, config, index);
   const topK = Math.max(1, Number(config.topK || 5));
   const minScore = Number(config.minScore || 0);
 
@@ -512,6 +514,10 @@ async function requestEmbeddings(texts: string[], config: Record<string, any>) {
     throw new Error('Embedding API 返回中未找到 embedding 向量');
   }
 
+  if (embeddings.length !== texts.length) {
+    throw new Error(`Embedding API returned ${embeddings.length} vectors for ${texts.length} inputs`);
+  }
+
   return embeddings;
 }
 
@@ -544,6 +550,22 @@ function sanitizeEmbeddingConfig(config: Record<string, any>) {
   const clone = cloneValue(config);
   if (clone.apiKey) clone.apiKey = '***';
   return clone;
+}
+
+function attachRuntimeEmbeddingConfig<T extends KnowledgeIndex>(index: T, config: Record<string, any>) {
+  try {
+    Object.defineProperty(index, '__runtimeEmbeddingConfig', {
+      value: cloneValue(config),
+      enumerable: false,
+      configurable: true
+    });
+  } catch {}
+  return index;
+}
+
+function getRuntimeEmbeddingConfig(index: KnowledgeIndex | null | undefined) {
+  const runtimeConfig = (index as any)?.__runtimeEmbeddingConfig;
+  return isPlainObject(runtimeConfig) ? runtimeConfig : {};
 }
 
 function normalizeFiles(input: any): File[] {
@@ -702,22 +724,28 @@ function splitText(text: string, chunkSize: number, chunkOverlap: number) {
   let start = 0;
 
   while (start < clean.length) {
-    const end = Math.min(clean.length, start + chunkSize);
-    let segment = clean.slice(start, end);
+    const maxEnd = Math.min(clean.length, start + chunkSize);
+    let sliceEnd = maxEnd;
+    const preview = clean.slice(start, maxEnd);
 
-    if (end < clean.length) {
-      const boundary = Math.max(segment.lastIndexOf('\n'), segment.lastIndexOf(' '));
+    if (maxEnd < clean.length) {
+      const boundary = Math.max(preview.lastIndexOf('\n'), preview.lastIndexOf(' '));
       if (boundary > chunkSize * 0.5) {
-        segment = segment.slice(0, boundary);
+        sliceEnd = start + boundary;
       }
     }
 
-    segment = segment.trim();
-    if (segment) {
-      chunks.push(segment);
+    const segment = clean.slice(start, sliceEnd).trim();
+    if (!segment) {
+      if (sliceEnd >= clean.length) break;
+      start = Math.min(clean.length, maxEnd);
+      continue;
     }
+    chunks.push(segment);
 
-    const nextStart = start + Math.max(1, segment.length - chunkOverlap);
+    if (sliceEnd >= clean.length) break;
+
+    const nextStart = Math.max(start + 1, sliceEnd - chunkOverlap);
     if (nextStart <= start) break;
     start = nextStart;
   }
@@ -725,7 +753,7 @@ function splitText(text: string, chunkSize: number, chunkOverlap: number) {
   return chunks;
 }
 
-async function resolveQueryEmbedding(queryInput: any, config: Record<string, any>, indexEmbeddingConfig: Record<string, any>) {
+async function resolveQueryEmbedding(queryInput: any, config: Record<string, any>, index: KnowledgeIndex) {
   if (Array.isArray(queryInput)) {
     return queryInput.map(Number);
   }
@@ -739,12 +767,16 @@ async function resolveQueryEmbedding(queryInput: any, config: Record<string, any
     throw new Error('索引检索节点需要 query 文本或 embedding 向量');
   }
 
+  const inheritedConfig = {
+    ...(index.embeddingConfig || {}),
+    ...getRuntimeEmbeddingConfig(index)
+  };
   const mergedConfig = {
-    ...indexEmbeddingConfig,
+    ...inheritedConfig,
     ...config,
-    endpoint: config.endpoint || indexEmbeddingConfig.endpoint,
-    apiKey: config.apiKey || indexEmbeddingConfig.apiKey,
-    model: config.model || indexEmbeddingConfig.model
+    endpoint: config.endpoint || inheritedConfig.endpoint,
+    apiKey: config.apiKey || inheritedConfig.apiKey,
+    model: config.model || inheritedConfig.model
   };
 
   const vectors = await requestEmbeddings([query], mergedConfig);

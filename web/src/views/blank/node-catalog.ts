@@ -223,6 +223,28 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
     ]
   },
   {
+    key: 'rag-qa',
+    label: 'PDF RAG 问答',
+    desc: '把 PDF 入库、语义检索和 LLM 回答串成一条完整链路。',
+    group: 'knowledge',
+    nodes: [
+      { presetKey: 'pdf-parse', dx: 0, dy: 0, isInit: true },
+      { presetKey: 'chunk-split', dx: 260, dy: 0 },
+      { presetKey: 'api-embedding', dx: 520, dy: 0 },
+      { presetKey: 'text', dx: 520, dy: 180, label: '问题', code: 'res = "What is TokenFlow?"', isInit: true },
+      { presetKey: 'index-search', dx: 780, dy: 60 },
+      { presetKey: 'llm-chat', dx: 1040, dy: 60, isOutput: true }
+    ],
+    edges: [
+      { from: 0, fromPort: 0, to: 1, toPort: 0 },
+      { from: 1, fromPort: 0, to: 2, toPort: 0 },
+      { from: 2, fromPort: 0, to: 4, toPort: 0 },
+      { from: 3, fromPort: 0, to: 4, toPort: 1 },
+      { from: 3, fromPort: 0, to: 5, toPort: 0 },
+      { from: 4, fromPort: 0, to: 5, toPort: 1 }
+    ]
+  },
+  {
     key: 'http-llm-summary',
     label: 'HTTP抓取后总结',
     desc: '请求远程数据后交给 LLM 总结',
