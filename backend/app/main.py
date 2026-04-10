@@ -22,6 +22,7 @@ app.add_middleware(
 )
 
 app.include_router(auth_router.router)
+app.include_router(auth_router.compat_router)
 app.include_router(profile_router.router)
 app.include_router(plugins_router.router)
 app.include_router(workspaces_router.router)

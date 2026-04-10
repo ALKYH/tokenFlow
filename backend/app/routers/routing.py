@@ -139,8 +139,8 @@ async def list_rules(session=Depends(get_session), user=Depends(get_optional_use
 @router.get('/summary', response_model=RoutingSummary)
 async def get_routing_summary(session=Depends(get_session), user=Depends(get_optional_user)):
     rules = await list_rules(session=session, user=user)
-    categories = sorted({rule.category for rule in rules})
-    channels = sorted({rule.channel for rule in rules})
+    categories = sorted({rule.category for rule in rules if rule.category}) or ['general']
+    channels = sorted({rule.channel for rule in rules if rule.channel}) or ['dashboard']
     return RoutingSummary(
         categories=categories,
         channels=channels,

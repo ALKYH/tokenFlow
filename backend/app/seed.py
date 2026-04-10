@@ -35,9 +35,23 @@ def _sample_workspace(name: str, description: str, category: str):
 
 async def seed_initial_data():
     async with AsyncSessionLocal() as session:
-        user_count = await session.scalar(select(func.count(User.id)))
-        if not user_count:
-            await create_user(session, 'demo@tokenflow.local', 'demo123456')
+        default_users = [
+            ('demo@tokenflow.local', 'demo123456', 'TokenFlow User'),
+            ('soybean@tokenflow.local', '123456', 'Soybean'),
+            ('super@tokenflow.local', '123456', 'Super'),
+            ('admin@tokenflow.local', '123456', 'Admin'),
+            ('user@tokenflow.local', '123456', 'User')
+        ]
+
+        for email, password, display_name in default_users:
+            existing_user = await session.scalar(select(User).where(User.email == email))
+            if existing_user:
+                if not existing_user.display_name:
+                    existing_user.display_name = display_name
+                    session.add(existing_user)
+                    await session.commit()
+                continue
+            await create_user(session, email, password, display_name=display_name)
 
         plugin_count = await session.scalar(select(func.count(Plugin.id)))
         if not plugin_count:

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import SvgIcon from '@/components/custom/svg-icon.vue';
 import {
+  deleteCloudWorkspace,
   fetchInboxChannels,
   fetchMarketplacePlugins,
   fetchMyCloudWorkspaces,
@@ -11,14 +12,14 @@ import {
   getStoredAccessToken,
   loadWorkspaceSnapshots,
   parseWorkspaceFile,
+  publishWorkspacePlugin,
   savePendingWorkspaceImport,
   saveWorkspaceSnapshot,
   type WorkspaceSnapshot
 } from '@/service/api';
-import { getLocale } from '@/locales';
 
 const router = useRouter();
-const isZh = computed(() => getLocale() === 'zh-CN');
+
 const localModules = ref<WorkspaceSnapshot[]>([]);
 const cloudModules = ref<any[]>([]);
 const cloudWorkspaces = ref<any[]>([]);
@@ -26,6 +27,8 @@ const popularModules = ref<any[]>([]);
 const inboxChannels = ref<any[]>([]);
 const loading = ref(false);
 const fileInputRef = ref<HTMLInputElement | null>(null);
+const workspaceQuery = ref('');
+const workspaceBusyMap = ref<Record<string, boolean>>({});
 
 const profile = ref({
   name: 'TokenFlow Builder',
@@ -37,15 +40,18 @@ const profile = ref({
 const totalNodes = computed(() => localModules.value.reduce((sum, item) => sum + Number(item.stats?.nodes || 0), 0));
 const latestModule = computed(() => localModules.value[0] || null);
 const token = computed(() => getStoredAccessToken());
-
-function t(zh: string, en: string) {
-  return isZh.value ? zh : en;
-}
+const filteredCloudWorkspaces = computed(() => {
+  const keyword = workspaceQuery.value.trim().toLowerCase();
+  if (!keyword) return cloudWorkspaces.value;
+  return cloudWorkspaces.value.filter(item =>
+    [item.name, item.description, item.file_type].filter(Boolean).some(part => String(part).toLowerCase().includes(keyword))
+  );
+});
 
 function formatTime(value?: string) {
-  if (!value) return t('未记录', 'N/A');
+  if (!value) return 'N/A';
   try {
-    return new Date(value).toLocaleString(isZh.value ? 'zh-CN' : 'en-US', { hour12: false });
+    return new Date(value).toLocaleString(undefined, { hour12: false });
   } catch {
     return value;
   }
@@ -72,6 +78,122 @@ function openCloudWorkspace(item: any) {
   openBlank({ workspaceId: String(item.id), source: 'cloud-workspace' });
 }
 
+function workspaceBusyKey(action: string, workspaceId: number | string) {
+  return `${action}:${workspaceId}`;
+}
+
+function setWorkspaceBusy(action: string, workspaceId: number | string, busy: boolean) {
+  const key = workspaceBusyKey(action, workspaceId);
+  workspaceBusyMap.value = { ...workspaceBusyMap.value, [key]: busy };
+}
+
+function isWorkspaceBusy(action: string, workspaceId: number | string) {
+  return !!workspaceBusyMap.value[workspaceBusyKey(action, workspaceId)];
+}
+
+function slugify(value: string) {
+  return String(value || 'workspace')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || `workspace-${Date.now()}`;
+}
+
+function getWorkspaceStats(item: any) {
+  const graph = item?.content?.graph || {};
+  return {
+    nodes: graph?.nodes?.length || 0,
+    edges: graph?.edges?.length || 0,
+    folders: graph?.folders?.length || 0
+  };
+}
+
+function exportCloudWorkspace(item: any) {
+  const payload = item?.content || {};
+  const fileName = `${slugify(item?.name || 'workspace')}-${Date.now()}.json`;
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  document.body.appendChild(anchor);
+  anchor.click();
+  setTimeout(() => {
+    URL.revokeObjectURL(url);
+    try { anchor.remove(); } catch {}
+  }, 3000);
+}
+
+function viewCloudWorkspace(item: any) {
+  const stats = getWorkspaceStats(item);
+  window.$dialog?.info({
+    title: item.name,
+    content: `${item.description || 'No description'}\n\nType: ${item.file_type || 'workspace'}\nNodes: ${stats.nodes}\nEdges: ${stats.edges}\nFolders: ${stats.folders}\nUpdated: ${formatTime(item.updated_at)}`,
+    positiveText: 'Close'
+  });
+}
+
+async function publishCloudWorkspace(item: any) {
+  const accessToken = token.value || getStoredAccessToken();
+  if (!accessToken) {
+    window.$message?.warning('Please sign in before publishing to marketplace');
+    return;
+  }
+
+  const workspaceId = Number(item.id);
+  setWorkspaceBusy('publish', workspaceId, true);
+  try {
+    const result = await publishWorkspacePlugin(
+      {
+        workspace_id: workspaceId,
+        name: item.name || 'Untitled Workspace',
+        slug: `${slugify(item.name || 'workspace')}-${Date.now()}`,
+        summary: item.description || 'Published from cloud workspace file',
+        category: 'workspace',
+        plugin_type: 'module',
+        tags: ['workspace', 'creative-market', 'home-dashboard'],
+        file_type: item.file_type || 'workspace',
+        is_public: true,
+        library_kind: 'personal'
+      },
+      accessToken
+    );
+    window.$message?.success(`Published: ${result?.name || item.name}`);
+  } catch (error: any) {
+    window.$message?.error(error?.message || 'Failed to publish');
+  } finally {
+    setWorkspaceBusy('publish', workspaceId, false);
+  }
+}
+
+async function removeCloudWorkspace(item: any) {
+  const accessToken = token.value || getStoredAccessToken();
+  if (!accessToken) {
+    window.$message?.warning('Please sign in before deleting cloud files');
+    return;
+  }
+
+  const workspaceId = Number(item.id);
+  window.$dialog?.warning({
+    title: 'Delete Cloud File',
+    content: `Delete ${item.name}? This cannot be undone.`,
+    positiveText: 'Delete',
+    negativeText: 'Cancel',
+    onPositiveClick: async () => {
+      setWorkspaceBusy('delete', workspaceId, true);
+      try {
+        await deleteCloudWorkspace(workspaceId, accessToken);
+        cloudWorkspaces.value = cloudWorkspaces.value.filter(workspace => Number(workspace.id) !== workspaceId);
+        window.$message?.success('Cloud file deleted');
+      } catch (error: any) {
+        window.$message?.error(error?.message || 'Failed to delete cloud file');
+      } finally {
+        setWorkspaceBusy('delete', workspaceId, false);
+      }
+    }
+  });
+}
+
 function triggerFileImport() {
   fileInputRef.value?.click();
 }
@@ -89,10 +211,10 @@ async function handleFileImport(event: Event) {
     });
     savePendingWorkspaceImport(saved);
     refreshLocalModules();
-    window.$message?.success(t('已读取本地模块文件，正在进入工作区', 'Module file loaded, opening workspace'));
+    window.$message?.success('Module file loaded, opening workspace');
     openBlank({ pending: '1', source: 'file-import' });
   } catch (error: any) {
-    window.$message?.error(error?.message || t('模块文件解析失败', 'Failed to parse module file'));
+    window.$message?.error(error?.message || 'Failed to parse module file');
   } finally {
     input.value = '';
   }
@@ -128,8 +250,8 @@ async function loadData() {
 
     profile.value = {
       name: profileData.display_name || 'TokenFlow User',
-      role: t('个人模块库成员', 'Personal Library Member'),
-      note: profileData.bio || t('已连接个人资料与云端模块服务', 'Connected to profile and cloud module services.'),
+      role: 'Personal Library Member',
+      note: profileData.bio || 'Connected to profile and cloud module services.',
       email: profileData.email || ''
     };
     cloudModules.value = libraryData;
@@ -139,6 +261,15 @@ async function loadData() {
     cloudWorkspaces.value = [];
   } finally {
     loading.value = false;
+  }
+}
+
+async function refreshCloudWorkspaceFiles() {
+  if (!token.value) return;
+  try {
+    cloudWorkspaces.value = await fetchMyCloudWorkspaces(token.value);
+  } catch {
+    cloudWorkspaces.value = [];
   }
 }
 
@@ -152,41 +283,41 @@ onMounted(loadData);
     <div class="hero-card">
       <div class="hero-copy">
         <div class="hero-kicker">Flow Workspace</div>
-        <h1 class="hero-title">{{ t('模块总览与云端同步入口', 'Module Overview And Cloud Sync') }}</h1>
+        <h1 class="hero-title">Module Overview And Cloud Sync</h1>
         <p class="hero-desc">
-          {{ t('在这里统一查看本地模块、云端个人模块库、云端工作区文件和收件箱渠道，并支持直接读取本地模块文件进入编辑器。', 'Review local modules, personal cloud modules, cloud workspaces and inbox channels, and open local module files directly into the editor.') }}
+          Review local modules, personal cloud modules, cloud workspaces and inbox channels, and open local module files directly into the editor.
         </p>
         <div class="hero-actions">
           <NButton type="primary" size="large" @click="openBlank()">
             <template #icon><SvgIcon icon="solar:play-circle-linear" /></template>
-            {{ t('进入工作区', 'Open Workspace') }}
+            Open Workspace
           </NButton>
           <NButton size="large" secondary @click="triggerFileImport">
             <template #icon><SvgIcon icon="solar:upload-linear" /></template>
-            {{ t('读取本地模块文件', 'Load Local Module File') }}
+            Load Local Module File
           </NButton>
           <NButton size="large" tertiary @click="openLocalModule(latestModule?.id)">
             <template #icon><SvgIcon icon="solar:folder-open-linear" /></template>
-            {{ t('打开最近模块', 'Open Latest Module') }}
+            Open Latest Module
           </NButton>
         </div>
       </div>
 
       <div class="hero-metrics">
         <div class="metric-card">
-          <div class="metric-label">{{ t('本地模块', 'Local Modules') }}</div>
+          <div class="metric-label">Local Modules</div>
           <div class="metric-value">{{ localModules.length }}</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">{{ t('云端个人模块', 'Cloud Modules') }}</div>
+          <div class="metric-label">Cloud Modules</div>
           <div class="metric-value">{{ cloudModules.length }}</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">{{ t('累计节点', 'Total Nodes') }}</div>
+          <div class="metric-label">Total Nodes</div>
           <div class="metric-value">{{ totalNodes }}</div>
         </div>
         <div class="metric-card">
-          <div class="metric-label">{{ t('收件箱渠道', 'Inbox Channels') }}</div>
+          <div class="metric-label">Inbox Channels</div>
           <div class="metric-value">{{ inboxChannels.length }}</div>
         </div>
       </div>
@@ -198,14 +329,14 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('本地模块', 'Local Modules') }}</div>
-                <div class="panel-subtitle">{{ t('从浏览器本地快照或导入文件继续进入可视化编辑器', 'Resume from browser snapshots or imported files.') }}</div>
+                <div class="panel-title">Local Modules</div>
+                <div class="panel-subtitle">Resume from browser snapshots or imported files.</div>
               </div>
-              <NButton tertiary @click="triggerFileImport">{{ t('导入文件', 'Import File') }}</NButton>
+              <NButton tertiary @click="triggerFileImport">Import File</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!localModules.length" :description="t('还没有本地模块，先在工作区创建或导入一个', 'No local modules yet.')" />
+          <NEmpty v-if="!localModules.length" description="No local modules yet." />
           <div v-else class="card-list">
             <div v-for="item in localModules" :key="item.id" class="module-card" @click="openLocalModule(item.id)">
               <div class="card-head">
@@ -213,10 +344,10 @@ onMounted(loadData);
                   <div class="module-title">{{ item.name }}</div>
                   <div class="module-desc">{{ item.description }}</div>
                 </div>
-                <NTag round type="info">{{ item.stats.nodes }} {{ t('节点', 'nodes') }}</NTag>
+                <NTag round type="info">{{ item.stats.nodes }} nodes</NTag>
               </div>
               <div class="card-meta">
-                <span>{{ item.stats.edges }} {{ t('连线', 'edges') }}</span>
+                <span>{{ item.stats.edges }} edges</span>
                 <span>{{ formatTime(item.updatedAt) }}</span>
               </div>
             </div>
@@ -229,20 +360,20 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('个人模块库', 'Personal Module Library') }}</div>
-                <div class="panel-subtitle">{{ t('显示后端保存到个人模块库的云端模块', 'Cloud modules saved into your personal library.') }}</div>
+                <div class="panel-title">Personal Module Library</div>
+                <div class="panel-subtitle">Cloud modules saved into your personal library.</div>
               </div>
             </div>
           </template>
 
           <NSpin :show="loading">
-            <NEmpty v-if="!cloudModules.length" :description="t('未登录或云端模块库为空', 'Sign in to load your cloud module library')" />
+            <NEmpty v-if="!cloudModules.length" description="Sign in to load your cloud module library" />
             <div v-else class="card-list">
               <div v-for="item in cloudModules" :key="item.id" class="module-card" @click="openCloudModule(item)">
                 <div class="card-head">
                   <div>
                     <div class="module-title">{{ item.name }}</div>
-                    <div class="module-desc">{{ item.summary || t('个人云端模块', 'Personal cloud module') }}</div>
+                    <div class="module-desc">{{ item.summary || 'Personal cloud module' }}</div>
                   </div>
                   <NTag round type="success">{{ item.plugin_type }}</NTag>
                 </div>
@@ -263,8 +394,8 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('个人信息', 'Profile') }}</div>
-                <div class="panel-subtitle">{{ t('登录后可同步模块、节点库和消息渠道', 'Sign in to sync modules, node library and inbox channels.') }}</div>
+                <div class="panel-title">Profile</div>
+                <div class="panel-subtitle">Sign in to sync modules, node library and inbox channels.</div>
               </div>
             </div>
           </template>
@@ -283,19 +414,19 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('收件箱渠道', 'Inbox Channels') }}</div>
-                <div class="panel-subtitle">{{ t('查看消息渠道数量，并前往收件箱管理接入方式', 'Review channel counts and manage intake methods in Inbox.') }}</div>
+                <div class="panel-title">Inbox Channels</div>
+                <div class="panel-subtitle">Review channel counts and manage intake methods in Inbox.</div>
               </div>
-              <NButton tertiary @click="router.push('/inbox')">{{ t('前往收件箱', 'Open Inbox') }}</NButton>
+              <NButton tertiary @click="router.push('/inbox')">Open Inbox</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!inboxChannels.length" :description="t('暂无渠道统计', 'No channel stats yet')" />
+          <NEmpty v-if="!inboxChannels.length" description="No channel stats yet" />
           <div v-else class="card-list">
             <div v-for="item in inboxChannels" :key="item.channel" class="channel-card">
               <div>
                 <div class="module-title">{{ item.channel }}</div>
-                <div class="module-desc">{{ item.unread }} {{ t('未读', 'unread') }}</div>
+                <div class="module-desc">{{ item.unread }} unread</div>
               </div>
               <NTag round type="warning">{{ item.count }}</NTag>
             </div>
@@ -310,14 +441,14 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('热门模块', 'Popular Modules') }}</div>
-                <div class="panel-subtitle">{{ t('从社区市场推荐较常用的模块模板', 'Recommended modules from the marketplace.') }}</div>
+                <div class="panel-title">Popular Modules</div>
+                <div class="panel-subtitle">Recommended modules from the marketplace.</div>
               </div>
-              <NButton tertiary @click="router.push('/marketplace')">{{ t('进入市场', 'Open Market') }}</NButton>
+              <NButton tertiary @click="router.push('/marketplace')">Open Market</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!popularModules.length" :description="t('暂无市场推荐', 'No market recommendations yet')" />
+          <NEmpty v-if="!popularModules.length" description="No market recommendations yet" />
           <div v-else class="card-list">
             <div v-for="item in popularModules" :key="item.id" class="module-card" @click="router.push('/marketplace')">
               <div class="card-head">
@@ -341,15 +472,24 @@ onMounted(loadData);
           <template #header>
             <div class="panel-header">
               <div>
-                <div class="panel-title">{{ t('云端工作区文件', 'Cloud Workspace Files') }}</div>
-                <div class="panel-subtitle">{{ t('读取后端保存的工作区文件并继续编辑', 'Open backend-saved workspace files and continue editing.') }}</div>
+                <div class="panel-title">Cloud Workspace Files</div>
+                <div class="panel-subtitle">View and manage cloud files, then publish them to marketplace.</div>
               </div>
+              <NButton tertiary @click="refreshCloudWorkspaceFiles">Refresh</NButton>
             </div>
           </template>
 
-          <NEmpty v-if="!cloudWorkspaces.length" :description="t('暂无云端工作区文件', 'No cloud workspace files yet')" />
+          <NInput
+            v-model:value="workspaceQuery"
+            clearable
+            size="small"
+            placeholder="Search cloud workspace files"
+            style="margin-bottom: 10px;"
+          />
+
+          <NEmpty v-if="!filteredCloudWorkspaces.length" description="No cloud workspace files yet" />
           <div v-else class="card-list">
-            <div v-for="item in cloudWorkspaces" :key="item.id" class="module-card" @click="openCloudWorkspace(item)">
+            <div v-for="item in filteredCloudWorkspaces" :key="item.id" class="module-card" @click="openCloudWorkspace(item)">
               <div class="card-head">
                 <div>
                   <div class="module-title">{{ item.name }}</div>
@@ -358,8 +498,30 @@ onMounted(loadData);
                 <NTag round type="primary">{{ item.file_type }}</NTag>
               </div>
               <div class="card-meta">
-                <span>ID {{ item.id }}</span>
+                <span>ID {{ item.id }} · {{ getWorkspaceStats(item).nodes }} nodes</span>
                 <span>{{ formatTime(item.updated_at) }}</span>
+              </div>
+              <div class="card-actions">
+                <NButton size="tiny" secondary @click.stop="viewCloudWorkspace(item)">View</NButton>
+                <NButton size="tiny" secondary @click.stop="exportCloudWorkspace(item)">Export</NButton>
+                <NButton
+                  size="tiny"
+                  tertiary
+                  type="success"
+                  :loading="isWorkspaceBusy('publish', item.id)"
+                  @click.stop="publishCloudWorkspace(item)"
+                >
+                  Publish
+                </NButton>
+                <NButton
+                  size="tiny"
+                  tertiary
+                  type="error"
+                  :loading="isWorkspaceBusy('delete', item.id)"
+                  @click.stop="removeCloudWorkspace(item)"
+                >
+                  Delete
+                </NButton>
               </div>
             </div>
           </div>
@@ -466,6 +628,13 @@ onMounted(loadData);
 
 .card-head {
   align-items: flex-start;
+}
+
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .module-card {

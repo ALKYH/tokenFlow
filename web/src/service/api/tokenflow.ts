@@ -127,8 +127,11 @@ export async function installMarketplacePlugin(pluginId: number, token?: string 
   return tokenflowRequest<any>(`/api/plugins/install/${pluginId}`, { method: 'POST', token });
 }
 
-export async function fetchMyCloudWorkspaces(token?: string | null, fileType?: string) {
-  const suffix = fileType ? `?file_type=${encodeURIComponent(fileType)}` : '';
+export async function fetchMyCloudWorkspaces(token?: string | null, fileType?: string, q?: string) {
+  const query = new URLSearchParams();
+  if (fileType) query.set('file_type', fileType);
+  if (q) query.set('q', q);
+  const suffix = query.toString() ? `?${query.toString()}` : '';
   return tokenflowRequest<any[]>(`/api/workspaces${suffix}`, { token });
 }
 
@@ -141,6 +144,10 @@ export async function saveCloudWorkspace(
   token?: string | null
 ) {
   return tokenflowRequest<any>('/api/workspaces', { method: 'POST', body: payload, token });
+}
+
+export async function deleteCloudWorkspace(workspaceId: number, token?: string | null) {
+  return tokenflowRequest<{ deleted: boolean; id: number }>(`/api/workspaces/${workspaceId}`, { method: 'DELETE', token });
 }
 
 export async function fetchMyProfile(token?: string | null) {

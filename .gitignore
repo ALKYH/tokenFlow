@@ -1,0 +1,39 @@
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+
+# Environment files (keep examples)
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+web/.env
+web/.env.*
+!web/.env.example
+
+# Logs / runtime
+*.log
+*.pid
+*.tmp
+
+# Playwright artifacts
+.playwright-cli/
+output/
+
+# Python artifacts
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/.venv/
+**/venv/
+
+# Node artifacts
+**/node_modules/
+**/dist/
+**/coverage/

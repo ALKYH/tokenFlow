@@ -1,0 +1,22 @@
+# Python bytecode / caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime / coverage
+storage/
+.coverage
+htmlcov/
+
+# Local env (keep template)
+.env
+.env.*
+!.env.example

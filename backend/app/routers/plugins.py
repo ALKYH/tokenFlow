@@ -83,6 +83,10 @@ async def publish_workspace_as_plugin(payload: PluginPublishFromWorkspace, sessi
         if not workspace or workspace.owner_id != user.id:
             raise HTTPException(status_code=404, detail='Workspace not found')
 
+    existing = await session.execute(select(Plugin).where(Plugin.slug == payload.slug))
+    if existing.scalar_one_or_none():
+        raise HTTPException(status_code=409, detail='Plugin slug already exists')
+
     runtime_secret = build_runtime_secret(await resolve_user_secret(session, user.id, payload.request_api_name))
     resolved_category, resolved_channel, route_kind = _resolve_category_and_channel(
         RoutingResolveRequest(

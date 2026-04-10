@@ -1,4 +1,4 @@
-from sqlalchemy import desc, select
+from sqlalchemy import desc, or_, select
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..deps import get_current_user, get_session
 from ..models.workspace_file import WorkspaceFile
@@ -10,12 +10,16 @@ router = APIRouter(prefix='/api/workspaces', tags=['workspaces'])
 @router.get('', response_model=list[WorkspaceFileRead])
 async def list_workspaces(
     file_type: str | None = Query(default=None),
+    q: str | None = Query(default=None),
     session=Depends(get_session),
     user=Depends(get_current_user)
 ):
     stmt = select(WorkspaceFile).where(WorkspaceFile.owner_id == user.id)
     if file_type and file_type != 'all':
         stmt = stmt.where(WorkspaceFile.file_type == file_type)
+    if q and q.strip():
+        like = f"%{q.strip()}%"
+        stmt = stmt.where(or_(WorkspaceFile.name.ilike(like), WorkspaceFile.description.ilike(like)))
     stmt = stmt.order_by(desc(WorkspaceFile.updated_at))
     result = await session.execute(stmt)
     return list(result.scalars().all())
@@ -34,7 +38,7 @@ async def save_workspace(payload: WorkspaceFileCreate, session=Depends(get_sessi
     workspace = None
     if payload.id is not None:
         workspace = await session.get(WorkspaceFile, payload.id)
-        if workspace and workspace.owner_id != user.id:
+        if not workspace or workspace.owner_id != user.id:
             raise HTTPException(status_code=404, detail='Workspace not found')
     if workspace is None:
         workspace = WorkspaceFile(
@@ -53,3 +57,13 @@ async def save_workspace(payload: WorkspaceFileCreate, session=Depends(get_sessi
     await session.commit()
     await session.refresh(workspace)
     return workspace
+
+
+@router.delete('/{workspace_id}')
+async def delete_workspace(workspace_id: int, session=Depends(get_session), user=Depends(get_current_user)):
+    workspace = await session.get(WorkspaceFile, workspace_id)
+    if not workspace or workspace.owner_id != user.id:
+        raise HTTPException(status_code=404, detail='Workspace not found')
+    await session.delete(workspace)
+    await session.commit()
+    return {'deleted': True, 'id': workspace_id}

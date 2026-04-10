@@ -23,11 +23,17 @@
     import { isBuiltinNode, runBuiltinNode } from './node-runtime';
     import { KNOWLEDGE_NODE_PRESETS, createKnowledgeNode, isKnowledgeNode } from './knowledge-pipeline';
     import {
+      deleteCloudWorkspace,
       consumePendingWorkspaceImport,
+      fetchMyCloudWorkspaces,
       fetchMyPluginLibrary,
       fetchWorkspaceById,
       getStoredAccessToken,
       loadWorkspaceSnapshots,
+      parseWorkspaceFile,
+      publishWorkspacePlugin,
+      saveCloudWorkspace,
+      saveWorkspaceSnapshot,
       uploadPlugin
     } from '@/service/api';
 
@@ -139,6 +145,9 @@
     ]);
     const savedNodeTemplates = ref<any[]>([]);
     const cloudModuleCount = ref(0);
+    const cloudWorkspaces = ref<any[]>([]);
+    const cloudWorkspacesLoading = ref(false);
+    const activeCloudWorkspaceId = ref<number | null>(null);
     const nodeTemplateStorageKey = 'tokenflow.local-node-templates.v1';
     const workspaceStorageKey = 'tokenflow.workspace.modules.v1';
     let workspaceSaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1033,6 +1042,7 @@
       loadNodeTemplates();
       rebuildNodeModules();
       refreshCloudModuleCount();
+      refreshCloudWorkspaces();
     });
 
     watch(nodes, () => queuePersistWorkspace(), { deep: true });
@@ -1105,10 +1115,7 @@
     }
 
     function exportModel() {
-      const model = { nodes: JSON.parse(JSON.stringify(nodes)), edges: JSON.parse(JSON.stringify(edges)) };
-      // 打印到控制台，可按需展示到弹窗
-      console.log('node-editor model', model);
-      alert(JSON.stringify(model, null, 2));
+      exportWorkspaceJson();
     }
 
     // export entire graph as a single Python program and trigger download
@@ -1224,6 +1231,7 @@
     // file input ref and import handler
     const fileInputRef = ref<HTMLInputElement | null>(null);
     const nodeTemplateInputRef = ref<HTMLInputElement | null>(null);
+    const workspaceImportInputRef = ref<HTMLInputElement | null>(null);
 
     function handleImportFile(e: Event) {
       try {
@@ -1255,6 +1263,29 @@
       try {
         if (nodeTemplateInputRef.value) nodeTemplateInputRef.value.click();
       } catch (e) { logDebug('openNodeTemplateDialog error', e); }
+    }
+
+    function openWorkspaceImportDialog() {
+      try {
+        if (workspaceImportInputRef.value) workspaceImportInputRef.value.click();
+      } catch (e) { logDebug('openWorkspaceImportDialog error', e); }
+    }
+
+    async function handleImportWorkspaceJson(event: Event) {
+      const input = event.target as HTMLInputElement;
+      const file = input.files?.[0];
+      if (!file) return;
+      try {
+        const snapshot = await parseWorkspaceFile(file);
+        loadWorkspaceSnapshot(snapshot);
+        activeCloudWorkspaceId.value = null;
+        saveWorkspaceSnapshot(snapshot);
+        window.$message?.success('Workspace JSON imported');
+      } catch (e: any) {
+        window.$message?.error(e?.message || 'Failed to import workspace JSON');
+      } finally {
+        input.value = '';
+      }
     }
 
     function serializeNodeTemplate(node: Node) {
@@ -1331,6 +1362,27 @@
           envVars: JSON.parse(JSON.stringify(envVars))
         }
       };
+    }
+
+    function downloadJsonFile(data: unknown, fileName: string) {
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = fileName;
+      document.body.appendChild(anchor);
+      anchor.click();
+      setTimeout(() => {
+        URL.revokeObjectURL(url);
+        try { anchor.remove(); } catch {}
+      }, 3000);
+    }
+
+    function exportWorkspaceJson() {
+      const workspace = serializeWorkspace();
+      const fileName = `${slugify(moduleMeta.name || 'workspace')}-${Date.now()}.json`;
+      downloadJsonFile(workspace, fileName);
+      window.$message?.success('Workspace JSON exported');
     }
 
     function slugify(value: string) {
@@ -1501,6 +1553,136 @@
       }
     }
 
+    async function refreshCloudWorkspaces() {
+      const token = getStoredAccessToken();
+      if (!token) {
+        cloudWorkspaces.value = [];
+        return;
+      }
+      cloudWorkspacesLoading.value = true;
+      try {
+        cloudWorkspaces.value = await fetchMyCloudWorkspaces(token);
+      } catch (e: any) {
+        cloudWorkspaces.value = [];
+        window.$message?.error(e?.message || 'Failed to load cloud workspace files');
+      } finally {
+        cloudWorkspacesLoading.value = false;
+      }
+    }
+
+    async function saveWorkspaceToCloud(showSuccess = true) {
+      const token = getStoredAccessToken();
+      if (!token) {
+        window.$message?.warning('Please sign in first, then save to cloud workspace files');
+        return null;
+      }
+      const payload = {
+        id: activeCloudWorkspaceId.value || undefined,
+        name: moduleMeta.name || 'Untitled Workspace',
+        description: moduleMeta.description || '',
+        file_type: 'workspace',
+        content: serializeWorkspace()
+      };
+      try {
+        const saved = await saveCloudWorkspace(payload, token);
+        activeCloudWorkspaceId.value = saved.id;
+        saveWorkspaceSnapshot(saved.content || payload.content);
+        if (showSuccess) {
+          window.$message?.success(payload.id ? 'Cloud workspace updated' : 'Cloud workspace saved');
+        }
+        await refreshCloudWorkspaces();
+        return saved;
+      } catch (e: any) {
+        window.$message?.error(e?.message || 'Failed to save cloud workspace file');
+        return null;
+      }
+    }
+
+    async function openCloudWorkspaceById(workspaceId: number) {
+      const token = getStoredAccessToken();
+      if (!token) {
+        window.$message?.warning('Please sign in first, then load cloud workspace files');
+        return;
+      }
+      try {
+        const workspace = await fetchWorkspaceById(workspaceId, token);
+        if (!workspace?.content) {
+          window.$message?.warning('Workspace file has no content');
+          return;
+        }
+        loadWorkspaceSnapshot(workspace.content);
+        activeCloudWorkspaceId.value = workspace.id;
+        window.$message?.success(`Loaded cloud file: ${workspace.name}`);
+      } catch (e: any) {
+        window.$message?.error(e?.message || 'Failed to load cloud workspace file');
+      }
+    }
+
+    async function deleteCloudWorkspaceById(workspaceId: number) {
+      const token = getStoredAccessToken();
+      if (!token) {
+        window.$message?.warning('Please sign in first, then delete cloud workspace files');
+        return;
+      }
+      const target = cloudWorkspaces.value.find(item => Number(item.id) === Number(workspaceId));
+      window.$dialog?.warning({
+        title: 'Delete cloud file',
+        content: `Delete "${target?.name || `Workspace #${workspaceId}`}" from cloud storage?`,
+        positiveText: 'Delete',
+        negativeText: 'Cancel',
+        onPositiveClick: async () => {
+          try {
+            await deleteCloudWorkspace(workspaceId, token);
+            if (activeCloudWorkspaceId.value === workspaceId) {
+              activeCloudWorkspaceId.value = null;
+            }
+            window.$message?.success('Cloud workspace file deleted');
+            await refreshCloudWorkspaces();
+          } catch (e: any) {
+            window.$message?.error(e?.message || 'Failed to delete cloud workspace file');
+          }
+        }
+      });
+    }
+
+    async function publishWorkspaceToMarketplace(workspaceId?: number) {
+      const token = getStoredAccessToken();
+      if (!token) {
+        window.$message?.warning('Please sign in first, then publish to marketplace');
+        return;
+      }
+      let targetWorkspaceId = workspaceId || activeCloudWorkspaceId.value || undefined;
+      if (!targetWorkspaceId) {
+        const saved = await saveWorkspaceToCloud(false);
+        targetWorkspaceId = saved?.id;
+      }
+      if (!targetWorkspaceId) {
+        window.$message?.error('Failed to prepare cloud workspace before publishing');
+        return;
+      }
+      try {
+        const result = await publishWorkspacePlugin(
+          {
+            workspace_id: targetWorkspaceId,
+            name: moduleMeta.name || 'Untitled Workspace',
+            slug: `${slugify(moduleMeta.name || 'workspace')}-${Date.now()}`,
+            summary: moduleMeta.description || 'Published from editor cloud workspace',
+            category: 'workspace',
+            plugin_type: 'module',
+            tags: ['workspace', 'creative-market', 'editor'],
+            file_type: 'workspace',
+            is_public: true,
+            library_kind: 'personal'
+          },
+          token
+        );
+        window.$message?.success(`Published to marketplace: ${result?.name || 'Success'}`);
+        await refreshCloudModuleCount();
+      } catch (e: any) {
+        window.$message?.error(e?.message || 'Failed to publish workspace to marketplace');
+      }
+    }
+
     async function saveWorkspaceToPersonalModule() {
       const token = getStoredAccessToken();
       if (!token) {
@@ -1562,6 +1744,7 @@
       const pending = consumePendingWorkspaceImport();
       if (pending && route.query.pending === '1') {
         loadWorkspaceSnapshot(pending);
+        activeCloudWorkspaceId.value = null;
         return true;
       }
 
@@ -1569,6 +1752,7 @@
         const target = loadWorkspaceSnapshots().find(item => item.id === route.query.module);
         if (target) {
           loadWorkspaceSnapshot(target);
+          activeCloudWorkspaceId.value = null;
           return true;
         }
       }
@@ -1580,6 +1764,7 @@
         const target = list.find(item => String(item.id) === String(route.query.cloudPlugin));
         if (target?.workspace_snapshot) {
           loadWorkspaceSnapshot(target.workspace_snapshot);
+          activeCloudWorkspaceId.value = null;
           return true;
         }
       }
@@ -1590,6 +1775,7 @@
         const workspace = await fetchWorkspaceById(Number(route.query.workspaceId), token);
         if (workspace?.content) {
           loadWorkspaceSnapshot(workspace.content);
+          activeCloudWorkspaceId.value = workspace.id;
           return true;
         }
       }
@@ -2396,6 +2582,9 @@
         :workflow-templates="WORKFLOW_TEMPLATES"
         :workflow-template-groups="WORKFLOW_TEMPLATE_GROUPS"
         :cloud-module-count="cloudModuleCount"
+        :cloud-workspaces="cloudWorkspaces"
+        :active-cloud-workspace-id="activeCloudWorkspaceId"
+        :cloud-workspaces-loading="cloudWorkspacesLoading"
         @toggle="leftCollapsed = !leftCollapsed"
         @add-preset="addPresetFromPanel"
         @apply-workflow-template="applyWorkflowTemplate"
@@ -2406,6 +2595,13 @@
         @import-saved-template="importSavedTemplate"
         @delete-saved-template="deleteSavedTemplate"
         @save-personal-module="saveWorkspaceToPersonalModule"
+        @save-cloud-workspace="saveWorkspaceToCloud"
+        @refresh-cloud-workspaces="refreshCloudWorkspaces"
+        @open-cloud-workspace="openCloudWorkspaceById"
+        @delete-cloud-workspace="deleteCloudWorkspaceById"
+        @publish-workspace="publishWorkspaceToMarketplace"
+        @import-workspace-json="openWorkspaceImportDialog"
+        @export-workspace-json="exportWorkspaceJson"
       />
 
       <div ref="areaRef" class="editor-area" style="flex:1;position:relative;border-radius:6px;overflow:visible" @pointerdown="onPointerDownArea">
@@ -2526,6 +2722,7 @@
           <!-- hidden file input for importing python files -->
           <input ref="fileInputRef" style="display:none" type="file" accept=".py" @change="(e) => handleImportFile(e)" />
           <input ref="nodeTemplateInputRef" style="display:none" type="file" accept=".json" @change="(e) => handleImportNodeTemplateFile(e)" />
+          <input ref="workspaceImportInputRef" style="display:none" type="file" accept=".json" @change="(e) => handleImportWorkspaceJson(e)" />
           <!-- update folder bounds reactively when nodes change -->
           <div style="display:none">
             <div v-for="f in folders" :key="f.id">{{ updateFolderBounds(f) }}</div>
