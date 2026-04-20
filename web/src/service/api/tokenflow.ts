@@ -13,6 +13,65 @@ type RequestOptions = {
 
 export type WorkspaceSnapshot = ReturnType<typeof normalizeWorkspaceSnapshot>;
 
+export type RuntimeResourcePayload = {
+  name: string;
+  kind: 'text' | 'base64_data';
+  text?: string;
+  base64_data?: string;
+  mime_type?: string;
+  encoding?: string;
+  metadata?: Record<string, any>;
+};
+
+export type RuntimeExecutionOptions = {
+  timeout_ms?: number;
+  max_output_bytes?: number;
+};
+
+export type NodeExecutionRequest = {
+  protocol_version: string;
+  request_id?: string;
+  node_id: string;
+  node_type: string;
+  execution_mode: 'python-module' | 'builtin' | 'auto';
+  module: {
+    source: string;
+    function_name: string;
+    args?: any[];
+    kwargs?: Record<string, any>;
+  };
+  inputs?: any[];
+  resources?: RuntimeResourcePayload[];
+  env?: Record<string, string>;
+  runtime?: RuntimeExecutionOptions;
+};
+
+export type NodeExecutionResponse = {
+  protocol_version: string;
+  request_id?: string;
+  status: 'ok' | 'failed';
+  output: any;
+  logs: string[];
+  error: null | {
+    code: string;
+    message: string;
+    detail?: any;
+    traceback?: string;
+  };
+  metrics: {
+    duration_ms: number;
+    cpu_ms?: number;
+    memory_peak_mb?: number;
+    timeout_seconds?: number;
+  };
+  trace: Array<{
+    node_id: string;
+    phase: string;
+    status: string;
+    detail?: string;
+  }>;
+};
+
 async function tokenflowRequest<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const token = options.token || getStoredAccessToken();
@@ -146,6 +205,22 @@ export async function saveCloudWorkspace(
   return tokenflowRequest<any>('/api/workspaces', { method: 'POST', body: payload, token });
 }
 
+export async function fetchRuntimeHealth(token?: string | null) {
+  return tokenflowRequest<any>('/api/runtime/health', { token });
+}
+
+export async function fetchRuntimeCapabilities(token?: string | null) {
+  return tokenflowRequest<any[]>('/api/runtime/capabilities', { token });
+}
+
+export async function executeRuntimeNode(payload: NodeExecutionRequest, token?: string | null) {
+  return tokenflowRequest<NodeExecutionResponse>('/api/runtime/execute-node', {
+    method: 'POST',
+    body: payload,
+    token
+  });
+}
+
 export async function deleteCloudWorkspace(workspaceId: number, token?: string | null) {
   return tokenflowRequest<{ deleted: boolean; id: number }>(`/api/workspaces/${workspaceId}`, { method: 'DELETE', token });
 }
@@ -243,6 +318,16 @@ export function normalizeWorkspaceSnapshot(snapshot: any) {
     description: next.description || '',
     kind: next.kind || next.file_type || 'workspace',
     version: next.version || '1.0.0',
+    executionMode:
+      next.executionMode ||
+      next.execution_mode ||
+      next.content?.executionMode ||
+      next.content?.execution_mode ||
+      next.graph?.executionMode ||
+      next.graph?.execution_mode ||
+      next.content?.graph?.executionMode ||
+      next.content?.graph?.execution_mode ||
+      'pyodide',
     updatedAt: next.updatedAt || next.updated_at || new Date().toISOString(),
     stats: {
       nodes: next.stats?.nodes || next.graph?.nodes?.length || next.content?.graph?.nodes?.length || 0,
@@ -257,7 +342,29 @@ export function normalizeWorkspaceSnapshot(snapshot: any) {
       nodes: next.graph?.nodes || next.content?.graph?.nodes || [],
       edges: next.graph?.edges || next.content?.graph?.edges || [],
       folders: next.graph?.folders || next.content?.graph?.folders || [],
-      envVars: next.graph?.envVars || next.content?.graph?.envVars || []
+      envVars: next.graph?.envVars || next.content?.graph?.envVars || [],
+      executionMode:
+        next.graph?.executionMode ||
+        next.graph?.execution_mode ||
+        next.content?.graph?.executionMode ||
+        next.content?.graph?.execution_mode ||
+        next.executionMode ||
+        next.execution_mode ||
+        next.content?.executionMode ||
+        next.content?.execution_mode ||
+        'pyodide',
+      nodeDefinitions:
+        next.graph?.nodeDefinitions ||
+        next.graph?.node_definitions ||
+        next.content?.graph?.nodeDefinitions ||
+        next.content?.graph?.node_definitions ||
+        {},
+      nodeParams:
+        next.graph?.nodeParams ||
+        next.graph?.node_params ||
+        next.content?.graph?.nodeParams ||
+        next.content?.graph?.node_params ||
+        {}
     }
   };
 }

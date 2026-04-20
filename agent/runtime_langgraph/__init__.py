@@ -1,6 +1,6 @@
 from .engine import CompiledRuntimeGraph, LangGraphRuntime, build_minimal_chain_plan
 from .registry import NodeRegistry, create_default_registry
-from .types import GraphNode, GraphPlan, GraphState
+from .graph_types import GraphNode, GraphPlan, GraphState
 
 __all__ = [
     "CompiledRuntimeGraph",
@@ -12,4 +12,3 @@ __all__ = [
     "build_minimal_chain_plan",
     "create_default_registry",
 ]
-

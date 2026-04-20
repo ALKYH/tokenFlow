@@ -25,13 +25,17 @@
     import {
       deleteCloudWorkspace,
       consumePendingWorkspaceImport,
+      executeRuntimeNode,
       fetchMyCloudWorkspaces,
       fetchMyPluginLibrary,
       fetchWorkspaceById,
       getStoredAccessToken,
       loadWorkspaceSnapshots,
+      type NodeExecutionRequest,
+      type NodeExecutionResponse,
       parseWorkspaceFile,
       publishWorkspacePlugin,
+      type RuntimeResourcePayload,
       saveCloudWorkspace,
       saveWorkspaceSnapshot,
       uploadPlugin
@@ -131,6 +135,7 @@
     function onRemoveIO(payload: { side: 'in' | 'out'; idx: number }) {
       removeNodeIO(selectedNodeId.value, payload.side, payload.idx);
     }
+    type FrontendExecutionMode = 'pyodide' | 'runtime';
     // let capturedEl: HTMLElement | null = null; // reserved for future use
     const hoverPort = ref<{ nodeId: string; type: 'in' | 'out'; index: number; invalid?: boolean } | null>(null);
     const debugLogs = reactive<string[]>([]);
@@ -138,7 +143,12 @@
     const pyReady = ref(false);
     const pyCode = ref(`print("hello from pyodide")`);
     const pyPackages = ref('');
-    const moduleMeta = reactive({ name: 'TokenFlow Workspace', description: 'Visual pipeline editor for nodes and knowledge workflows', requires: '' });
+    const moduleMeta = reactive({
+      name: 'TokenFlow Workspace',
+      description: 'Visual pipeline editor for nodes and knowledge workflows',
+      requires: '',
+      executionMode: 'pyodide' as FrontendExecutionMode
+    });
     const envVars = reactive<Array<{ key: string; value: string; secret?: boolean }>>([
       { key: 'EMBEDDING_ENDPOINT', value: '', secret: false },
       { key: 'EMBEDDING_API_KEY', value: '', secret: true }
@@ -199,6 +209,178 @@
         if (debugLogs.length > 80) debugLogs.pop();
       } catch (e) {}
       try { console.debug(...args); } catch (e) {}
+    }
+
+    const PYTHON_KEYWORDS = new Set([
+      'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del',
+      'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal',
+      'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield'
+    ]);
+
+    function sanitizePythonName(rawName: string | undefined, index: number) {
+      let name = (rawName || '').trim().replace(/[^0-9a-zA-Z_]/g, '_');
+      if (!name) name = `arg${index}`;
+      if (/^[0-9]/.test(name)) name = `arg${index}`;
+      if (PYTHON_KEYWORDS.has(name)) name = `${name}_`;
+      return name;
+    }
+
+    function extractNodeOutput(value: any) {
+      if (value && typeof value === 'object' && (value as any).mode === 'runtime' && 'output' in (value as any)) {
+        return (value as any).output;
+      }
+      return value;
+    }
+
+    function resolveNodeExecutionMode(node: Node): FrontendExecutionMode {
+      const override = (node as any)?.meta?.execution?.mode;
+      if (override === 'runtime' || override === 'pyodide') return override;
+      return moduleMeta.executionMode === 'runtime' ? 'runtime' : 'pyodide';
+    }
+
+    function toggleExecutionMode() {
+      moduleMeta.executionMode = moduleMeta.executionMode === 'runtime' ? 'pyodide' : 'runtime';
+      const modeLabel = moduleMeta.executionMode === 'runtime' ? 'Runtime' : 'Pyodide';
+      logDebug('execution mode switched', modeLabel);
+      window.$message?.success(`Execution mode: ${modeLabel}`);
+    }
+
+    function collectRuntimeEnv() {
+      return Object.fromEntries(
+        (envVars || [])
+          .filter(item => item?.key)
+          .map(item => [String(item.key), String(item.value ?? '')])
+      );
+    }
+
+    function bytesToBase64(bytes: Uint8Array) {
+      const chunkSize = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    async function collectRuntimeResources(node: Node): Promise<RuntimeResourcePayload[]> {
+      const resources = Array.isArray(node.resources) ? node.resources : [];
+      const normalized: RuntimeResourcePayload[] = [];
+      for (const resource of resources) {
+        try {
+          const file = resource?.file;
+          if (file instanceof File) {
+            const fileType = file.type || 'application/octet-stream';
+            const isTextFile = /^text\//i.test(fileType) || /\.(txt|md|json|csv|log|ya?ml|xml)$/i.test(file.name);
+            if (isTextFile) {
+              normalized.push({
+                name: file.name,
+                kind: 'text',
+                text: await file.text(),
+                mime_type: fileType,
+                encoding: 'utf-8'
+              });
+            } else {
+              const bytes = new Uint8Array(await file.arrayBuffer());
+              normalized.push({
+                name: file.name,
+                kind: 'base64_data',
+                base64_data: bytesToBase64(bytes),
+                mime_type: fileType,
+                encoding: 'base64'
+              });
+            }
+            continue;
+          }
+          if (typeof (resource as any)?.text === 'string') {
+            normalized.push({
+              name: resource?.name || `resource_${normalized.length + 1}`,
+              kind: 'text',
+              text: String((resource as any).text),
+              mime_type: String((resource as any).mime_type || 'text/plain'),
+              encoding: String((resource as any).encoding || 'utf-8')
+            });
+          }
+        } catch (error: any) {
+          logDebug('collectRuntimeResources skipped one resource', resource?.name, error?.message || String(error));
+        }
+      }
+      return normalized;
+    }
+
+    function buildRuntimeModuleSource(node: Node) {
+      const inputNames = (node.inputs || []).map((name, index) => sanitizePythonName(name, index));
+      const bindingLines = inputNames.map((name, index) => `    ${name} = inputs[${index}] if len(inputs) > ${index} else None`);
+      const userCode = ((node as any).code || 'res = None').split('\n');
+      const pyLines = [
+        'def __tokenflow_node_entry(inputs, context, resources):',
+        '    inputs = inputs or []',
+        ...bindingLines,
+        ...userCode.map((line: string) => `    ${line}`),
+        '    try:',
+        '        return res',
+        '    except NameError:',
+        '        return None'
+      ];
+      return pyLines.join('\n');
+    }
+
+    async function buildRuntimeExecutionRequest(node: Node, inputs: any[]): Promise<NodeExecutionRequest> {
+      const runtimeOptions: Record<string, any> = {};
+      const timeoutMs = Number((node as any)?.meta?.config?.runtimeTimeoutMs ?? 12000);
+      if (Number.isFinite(timeoutMs)) runtimeOptions.timeout_ms = Math.max(1, Math.min(120000, Math.trunc(timeoutMs)));
+      const maxOutputBytes = Number((node as any)?.meta?.config?.maxOutputBytes ?? 262144);
+      if (Number.isFinite(maxOutputBytes)) runtimeOptions.max_output_bytes = Math.max(1024, Math.min(5242880, Math.trunc(maxOutputBytes)));
+
+      const payload: NodeExecutionRequest = {
+        protocol_version: '1.0.0',
+        request_id: `req_${node.id}_${Date.now()}`,
+        node_id: node.id,
+        node_type: node.category || 'python_snippet',
+        execution_mode: 'python-module',
+        module: {
+          source: buildRuntimeModuleSource(node),
+          function_name: '__tokenflow_node_entry',
+          args: [inputs],
+          kwargs: {}
+        },
+        inputs,
+        resources: await collectRuntimeResources(node),
+        env: collectRuntimeEnv()
+      };
+      if (Object.keys(runtimeOptions).length) payload.runtime = runtimeOptions;
+      return payload;
+    }
+
+    async function runNodeViaRuntime(node: Node, inputs: any[]) {
+      const requestPayload = await buildRuntimeExecutionRequest(node, inputs);
+      const response: NodeExecutionResponse = await executeRuntimeNode(requestPayload);
+      const runtimeResult = {
+        mode: 'runtime',
+        status: response.status,
+        output: response.output,
+        logs: response.logs || [],
+        error: response.error || null,
+        metrics: response.metrics || {},
+        durationMs: Number(response.metrics?.duration_ms || 0),
+        trace: response.trace || []
+      };
+
+      node.lastResult = runtimeResult;
+      (node as any).meta = (node as any).meta || {};
+      (node as any).meta.lastExecution = runtimeResult;
+
+      if (runtimeResult.logs.length) {
+        for (const line of runtimeResult.logs) {
+          logDebug(`runtime ${node.id}: ${line}`);
+        }
+      }
+      if (response.status === 'ok') {
+        logDebug('runtime node executed', node.id, `duration=${runtimeResult.durationMs}ms`);
+        try { (node as any).status = 'done'; } catch (e) {}
+        return;
+      }
+      logDebug('runtime node failed', node.id, response.error?.code || 'UNKNOWN', response.error?.message || '');
+      try { (node as any).status = 'error'; } catch (e) {}
     }
 
     async function ensureHighlighter() {
@@ -473,21 +655,9 @@
           }
           for (const n of bNodes) if (!order.includes(n.id)) order.push(n.id);
 
-          // build python code to run subgraph and collect outputs
-          const PY_KEYWORDS = new Set([
-            'False','None','True','and','as','assert','async','await','break','class','continue','def','del','elif','else','except','finally','for','from','global','if','import','in','is','lambda','nonlocal','not','or','pass','raise','return','try','while','with','yield'
-          ]);
-          function sanitizeName(name: string, idx: number) {
-            let nm = (name && name.trim()) ? name.replace(/[^0-9a-zA-Z_]/g, '_') : '';
-            if (!nm) nm = `arg${idx}`;
-            if (/^[0-9]/.test(nm)) nm = `arg${idx}`;
-            if (PY_KEYWORDS.has(nm)) nm = nm + '_';
-            return nm;
-          }
-
           // folded input param names (sanitized) mapped to inputNodes order
           const foldedInputLabels = inputNodes.map(n => (n.label || n.id));
-          const foldedParamNames = foldedInputLabels.map((l: string, i: number) => sanitizeName(l, i));
+          const foldedParamNames = foldedInputLabels.map((l: string, i: number) => sanitizePythonName(l, i));
 
           // prepare inputs array from external sources: for each inputNode, find incoming edge from external and get its source lastResult
           const inputsArray: any[] = [];
@@ -496,7 +666,7 @@
             const inc = (bEdges || []).find((ee: any) => ee.to.nodeId === inNode.id && !bNodeIds.has(ee.from.nodeId));
             if (inc) {
               const src = nodes.find(n => n.id === inc.from.nodeId);
-              inputsArray.push(src ? (('lastResult' in src) ? (src as any).lastResult : null) : null);
+              inputsArray.push(src ? extractNodeOutput((src as any).lastResult) : null);
             } else {
               inputsArray.push(null);
             }
@@ -585,7 +755,7 @@
           const e = edges.find(ed => ed.to.nodeId === node.id && ed.to.portIndex === i);
           if (e) {
             const src = nodes.find(n => n.id === e.from.nodeId);
-            inputs.push(src ? (('lastResult' in src) ? (src as any).lastResult : null) : null);
+            inputs.push(src ? extractNodeOutput((src as any).lastResult) : null);
           } else {
             inputs.push(null);
           }
@@ -609,6 +779,25 @@
         try { (node as any).status = 'done'; } catch (e) {}
         return;
       }
+      if (resolveNodeExecutionMode(node) === 'runtime') {
+        try {
+          await runNodeViaRuntime(node, inputs);
+        } catch (err: any) {
+          logDebug('runNode runtime error: ' + (err?.toString ? err.toString() : String(err)));
+          node.lastResult = {
+            mode: 'runtime',
+            status: 'failed',
+            output: null,
+            logs: [],
+            error: { message: err?.message || String(err) },
+            metrics: { duration_ms: 0 },
+            durationMs: 0,
+            trace: []
+          };
+          try { (node as any).status = 'error'; } catch (e) {}
+        }
+        return;
+      }
       if (!pyReady.value) {
         logDebug('pyodide not ready yet');
         try { (node as any).status = 'idle'; } catch (e) {}
@@ -618,16 +807,8 @@
         try { pyodide.value.globals.set('__node_args', inputs); } catch (e) { /* ignore */ }
         const userCode = (node as any).code || '';
         // build param name list (use provided input names or fallback arg0..)
-        // sanitize parameter names: remove invalid chars and avoid Python keywords
-        const PY_KEYWORDS = new Set([
-          'False','None','True','and','as','assert','async','await','break','class','continue','def','del','elif','else','except','finally','for','from','global','if','import','in','is','lambda','nonlocal','not','or','pass','raise','return','try','while','with','yield'
-        ]);
         const paramNames: string[] = (node.inputs && node.inputs.length) ? node.inputs.map((nm, i) => {
-          let name = (nm && nm.trim()) ? nm.replace(/[^0-9a-zA-Z_]/g, '_') : '';
-          if (!name) name = `arg${i}`;
-          if (/^[0-9]/.test(name)) name = `arg${i}`;
-          if (PY_KEYWORDS.has(name)) name = name + '_';
-          return name;
+          return sanitizePythonName(nm, i);
         }) : [];
         const pyParts: string[] = [];
         // create a unique function wrapper so the user's code runs in a local scope
@@ -1018,6 +1199,10 @@
       if (e.key === 'Escape' && contextMenu.visible) {
         closeContextMenu();
       }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        toggleExecutionMode();
+      }
     }
 
     onMounted(async () => {
@@ -1049,7 +1234,7 @@
     watch(edges, () => queuePersistWorkspace(), { deep: true });
     watch(folders, () => queuePersistWorkspace(), { deep: true });
     watch(envVars, () => queuePersistWorkspace(), { deep: true });
-    watch(() => [moduleMeta.name, moduleMeta.description, moduleMeta.requires], () => queuePersistWorkspace(), { deep: true });
+    watch(() => [moduleMeta.name, moduleMeta.description, moduleMeta.requires, moduleMeta.executionMode], () => queuePersistWorkspace(), { deep: true });
 
     onBeforeUnmount(() => {
       if (workspaceSaveTimer) clearTimeout(workspaceSaveTimer);
@@ -1343,12 +1528,98 @@
       } catch (e) { logDebug('persistNodeTemplates error', e); }
     }
 
+    function buildNodeDefinitionSnapshot(node: Node) {
+      return {
+        node_id: node.id,
+        node_type: node.category || 'custom',
+        definition_version: String((node as any)?.meta?.template?.version || '1.0.0'),
+        template: (node as any)?.meta?.template || null,
+        execution: {
+          preferred_mode: resolveNodeExecutionMode(node),
+          runtime: {
+            execution_mode: 'python-module',
+            function_name: '__tokenflow_node_entry'
+          }
+        },
+        source_kind: isBuiltinNode(node.category) || node.category === 'note' ? 'builtin' : 'python-snippet'
+      };
+    }
+
+    function buildNodeParamsSnapshot(node: Node) {
+      const resources = (node.resources || []).map(item => ({
+        id: item.id,
+        name: item.name,
+        kind: item.kind || '',
+        size: item.size || 0,
+        lastModified: item.lastModified || 0,
+        mime_type: item.file?.type || ''
+      }));
+      return {
+        label: node.label || node.id,
+        inputs: [...(node.inputs || [])],
+        outputs: [...(node.outputs || [])],
+        inputTypes: [...((node as any).inputTypes || [])],
+        outputTypes: [...((node as any).outputTypes || [])],
+        code: String((node as any).code || ''),
+        config: JSON.parse(JSON.stringify((node as any)?.meta?.config || {})),
+        note: String((node as any)?.meta?.note || ''),
+        isInit: !!(node as any).isInit,
+        isOutput: !!(node as any).isOutput,
+        color: node.color || '',
+        execution_mode_override:
+          (node as any)?.meta?.execution?.mode === 'runtime' || (node as any)?.meta?.execution?.mode === 'pyodide'
+            ? (node as any).meta.execution.mode
+            : null,
+        resources
+      };
+    }
+
+    function buildNodeArtifactSnapshot() {
+      const nodeDefinitions: Record<string, any> = {};
+      const nodeParams: Record<string, any> = {};
+      for (const node of nodes) {
+        nodeDefinitions[node.id] = buildNodeDefinitionSnapshot(node);
+        nodeParams[node.id] = buildNodeParamsSnapshot(node);
+      }
+      return { nodeDefinitions, nodeParams };
+    }
+
+    function applyNodeArtifactSnapshot(node: any, nodeDefinition: any, nodeParams: any) {
+      const next = node || {};
+      if (nodeParams && typeof nodeParams === 'object') {
+        if (typeof nodeParams.label === 'string') next.label = nodeParams.label;
+        if (Array.isArray(nodeParams.inputs)) next.inputs = [...nodeParams.inputs];
+        if (Array.isArray(nodeParams.outputs)) next.outputs = [...nodeParams.outputs];
+        if (Array.isArray(nodeParams.inputTypes)) next.inputTypes = [...nodeParams.inputTypes];
+        if (Array.isArray(nodeParams.outputTypes)) next.outputTypes = [...nodeParams.outputTypes];
+        if (typeof nodeParams.code === 'string') next.code = nodeParams.code;
+        if (typeof nodeParams.isInit === 'boolean') next.isInit = nodeParams.isInit;
+        if (typeof nodeParams.isOutput === 'boolean') next.isOutput = nodeParams.isOutput;
+        if (typeof nodeParams.color === 'string') next.color = nodeParams.color || next.color;
+        if (Array.isArray(nodeParams.resources)) next.resources = [...nodeParams.resources];
+        next.meta = next.meta || {};
+        if (nodeParams.config && typeof nodeParams.config === 'object') next.meta.config = { ...nodeParams.config };
+        if (typeof nodeParams.note === 'string') next.meta.note = nodeParams.note;
+        if (nodeParams.execution_mode_override === 'runtime' || nodeParams.execution_mode_override === 'pyodide') {
+          next.meta.execution = { ...next.meta.execution, mode: nodeParams.execution_mode_override };
+        }
+        next.meta.params = nodeParams;
+      }
+      if (nodeDefinition && typeof nodeDefinition === 'object') {
+        next.meta = next.meta || {};
+        next.meta.definition = nodeDefinition;
+      }
+      return next;
+    }
+
     function serializeWorkspace() {
+      const { nodeDefinitions, nodeParams } = buildNodeArtifactSnapshot();
       return {
         id: `workspace_${moduleMeta.name || 'default'}`,
         name: moduleMeta.name || 'Untitled Workspace',
         description: moduleMeta.description || '',
         requires: moduleMeta.requires || '',
+        executionMode: moduleMeta.executionMode,
         updatedAt: new Date().toISOString(),
         stats: {
           nodes: nodes.length,
@@ -1359,7 +1630,10 @@
           nodes: JSON.parse(JSON.stringify(nodes)),
           edges: JSON.parse(JSON.stringify(edges)),
           folders: JSON.parse(JSON.stringify(folders)),
-          envVars: JSON.parse(JSON.stringify(envVars))
+          envVars: JSON.parse(JSON.stringify(envVars)),
+          executionMode: moduleMeta.executionMode,
+          nodeDefinitions,
+          nodeParams
         }
       };
     }
@@ -1467,7 +1741,7 @@
         if (!node) return;
         if (item.label) node.label = item.label;
         if (typeof item.code === 'string') node.code = item.code;
-        if (item.meta) node.meta = { ...(node.meta || {}), ...item.meta };
+        if (item.meta) node.meta = { ...node.meta, ...item.meta };
         if (item.isInit != null) (node as any).isInit = !!item.isInit;
         if (item.isOutput != null) (node as any).isOutput = !!item.isOutput;
         nodes.push(node);
@@ -1530,13 +1804,25 @@
     function loadWorkspaceSnapshot(snapshot: any) {
       if (!snapshot) return;
       const graph = snapshot.graph || snapshot.content?.graph || {};
-      nodes.splice(0, nodes.length, ...JSON.parse(JSON.stringify(graph.nodes || [])));
+      const rawNodes = JSON.parse(JSON.stringify(graph.nodes || []));
+      const nodeDefinitions = graph.nodeDefinitions || graph.node_definitions || {};
+      const nodeParams = graph.nodeParams || graph.node_params || {};
+      const hydratedNodes = rawNodes.map((item: any) => applyNodeArtifactSnapshot(item, nodeDefinitions?.[item.id], nodeParams?.[item.id]));
+      nodes.splice(0, nodes.length, ...hydratedNodes);
       edges.splice(0, edges.length, ...JSON.parse(JSON.stringify(graph.edges || [])));
       folders.splice(0, folders.length, ...JSON.parse(JSON.stringify(graph.folders || [])));
       envVars.splice(0, envVars.length, ...JSON.parse(JSON.stringify(graph.envVars || [])));
       moduleMeta.name = snapshot.name || snapshot.content?.name || 'TokenFlow Workspace';
       moduleMeta.description = snapshot.description || snapshot.content?.description || '';
       moduleMeta.requires = snapshot.requires || snapshot.content?.requires || '';
+      const executionMode =
+        snapshot.executionMode ||
+        snapshot.execution_mode ||
+        snapshot.content?.executionMode ||
+        snapshot.content?.execution_mode ||
+        graph.executionMode ||
+        graph.execution_mode;
+      moduleMeta.executionMode = executionMode === 'runtime' ? 'runtime' : 'pyodide';
       selectedIds.value = [];
       nodeSeq = Math.max(1, nodes.length + 1);
       rebuildNodeModules();
@@ -2608,6 +2894,7 @@
         <!-- Editor toolbar positioned inside workspace -->
         <EditorToolbar
           :pan-mode="panMode"
+          :execution-mode="moduleMeta.executionMode"
           :exec-status="execStatus"
           :project-name="projectConfig.name"
           :left-offset="toolbarLeftOffset"
@@ -2619,6 +2906,7 @@
           @export-py="exportPython"
           @import-py="openFileDialog"
           @import-node="openNodeTemplateDialog"
+          @toggle-execution-mode="toggleExecutionMode"
           @toggle-pan="panMode = !panMode"
         />
         <!-- ear buttons: visible when corresponding sidebar is collapsed -->
@@ -2736,6 +3024,7 @@
 
       <RightSidebar
         :selected-node="selectedNode" :selected-folder="selectedFolder" :nodes="nodes" :right-collapsed="rightCollapsed"
+        :execution-mode="moduleMeta.executionMode"
         @toggle="rightCollapsed = !rightCollapsed"
         @update-label="handleNodeLabelInput"
         @update-i-o="onUpdateIO"

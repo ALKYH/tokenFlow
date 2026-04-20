@@ -2,7 +2,14 @@
 import { computed } from 'vue';
 import SvgIcon from '@/components/custom/svg-icon.vue';
 
-const props = defineProps<{ panMode: boolean; leftOffset?: number; rightOffset?: number; execStatus?: any; projectName?: string }>();
+const props = defineProps<{
+  panMode: boolean;
+  executionMode?: 'pyodide' | 'runtime';
+  leftOffset?: number;
+  rightOffset?: number;
+  execStatus?: any;
+  projectName?: string;
+}>();
 const emit = defineEmits<{
   (e: 'add'): void
   (e: 'runGraph'): void
@@ -12,6 +19,7 @@ const emit = defineEmits<{
   (e: 'importPy'): void
   (e: 'importNode'): void
   (e: 'togglePan'): void
+  (e: 'toggleExecutionMode'): void
 }>();
 
 const toolbarStyle = computed(() => {
@@ -36,6 +44,14 @@ const secondaryActions = computed(() => [
   { key: 'import-py', label: 'Import Python', hint: '.py', icon: 'solar:code-square-linear', action: () => emit('importPy') },
   { key: 'export-json', label: 'Export JSON', hint: 'Ctrl+S', icon: 'solar:export-linear', action: () => emit('export') },
   { key: 'export-py', label: 'Export Python', hint: '.py', icon: 'solar:plain-2-linear', action: () => emit('exportPy') },
+  {
+    key: 'execution-mode',
+    label: props.executionMode === 'runtime' ? 'Runtime Mode' : 'Pyodide Mode',
+    hint: 'Ctrl+M',
+    icon: props.executionMode === 'runtime' ? 'solar:server-square-linear' : 'solar:code-circle-linear',
+    type: props.executionMode === 'runtime' ? 'success' : 'default',
+    action: () => emit('toggleExecutionMode')
+  },
   { key: 'clear', label: 'Clear Canvas', hint: 'Shift+Del', icon: 'solar:trash-bin-trash-linear', action: () => emit('clear') },
   {
     key: 'pan',

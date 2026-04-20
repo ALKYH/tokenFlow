@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 import traceback
 
-from .types import ErrorInfo, GraphNode, GraphState, TraceEntry
+from .graph_types import ErrorInfo, GraphNode, GraphState, TraceEntry
 
 
 def ensure_graph_state(raw_state: GraphState | None) -> GraphState:
@@ -52,4 +52,3 @@ def build_error_info(node: GraphNode, phase: str, exc: Exception) -> ErrorInfo:
         "message": str(exc),
         "traceback": traceback.format_exc(),
     }
-

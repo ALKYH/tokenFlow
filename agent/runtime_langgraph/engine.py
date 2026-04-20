@@ -12,7 +12,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 from .registry import NodeRegistry, create_default_registry
 from .state import append_trace, ensure_graph_state
-from .types import GraphNode, GraphPlan, GraphState
+from .graph_types import GraphNode, GraphPlan, GraphState
 
 
 @dataclass
@@ -132,4 +132,3 @@ def build_minimal_chain_plan() -> GraphPlan:
     ]
     edges = [("const_1", "python_snippet_1"), ("python_snippet_1", "print_1")]
     return GraphPlan(nodes=nodes, edges=edges, entrypoint="const_1")
-

@@ -2,7 +2,13 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue';
 import { getBuiltinNodeConfigText, isBuiltinNode } from '../node-runtime';
 
-const props = defineProps<{ selectedNode: any; selectedFolder?: any; rightCollapsed: boolean; nodes?: any[] }>();
+const props = defineProps<{
+  selectedNode: any;
+  selectedFolder?: any;
+  rightCollapsed: boolean;
+  nodes?: any[];
+  executionMode?: 'pyodide' | 'runtime';
+}>();
 const emit = defineEmits<{
   (e: 'updateLabel', payload: any): void
   (e: 'updateIO', payload: any): void
@@ -35,6 +41,9 @@ const localCodeEl = ref<HTMLElement | null>(null);
 const isBuiltinConfigNode = computed(() => isBuiltinNode(props.selectedNode?.category));
 const builtinConfigText = computed(() => getBuiltinNodeConfigText(props.selectedNode));
 const isLlmNode = computed(() => ['llm-chat', 'agent-task'].includes(props.selectedNode?.category));
+const hideRawCodeEditor = computed(
+  () => props.executionMode === 'runtime' && !isBuiltinConfigNode.value && props.selectedNode?.category !== 'note'
+);
 
 const llmConfig = computed(() => {
   const config = props.selectedNode?.meta?.config || {};
@@ -292,11 +301,14 @@ function isChildEnabled(folder: any, childId: string) {
 
             <template v-else>
               <div class="prop-section-title">代码模块</div>
-              <div ref="localCodeEl" class="prop-input code-editor"></div>
+              <div v-if="hideRawCodeEditor" class="runtime-config-hint">
+                Runtime mode composes executable code from node parameters and definition version on the backend.
+              </div>
+              <div v-else ref="localCodeEl" class="prop-input code-editor"></div>
               <div class="action-row">
-                <NButton size="small" secondary @click="$emit('insertTemplate')">生成模板</NButton>
+                <NButton v-if="!hideRawCodeEditor" size="small" secondary @click="$emit('insertTemplate')">生成模板</NButton>
                 <NButton size="small" type="primary" @click="$emit('runNode')">运行节点</NButton>
-                <NButton size="small" @click="onSave">保存代码</NButton>
+                <NButton v-if="!hideRawCodeEditor" size="small" @click="onSave">保存代码</NButton>
               </div>
             </template>
           </div>
@@ -353,6 +365,7 @@ function isChildEnabled(folder: any, childId: string) {
 .input-textarea { min-height: 140px; resize: vertical; }
 .code-textarea { font-family: Consolas, Monaco, monospace; }
 .code-editor { height: 220px; background: linear-gradient(180deg, rgba(8,10,12,.96), rgba(6,7,9,.96)); border-radius: 12px; overflow: hidden; }
+.runtime-config-hint { padding: 10px 12px; border-radius: 12px; border: 1px dashed rgba(59, 130, 246, .3); background: rgba(59, 130, 246, .08); color: #1e3a8a; line-height: 1.5; font-size: 12px; }
 .toggle-grid, .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .flag-card { display: flex; align-items: center; justify-content: space-between; border: 1px solid rgba(148,163,184,.16); background: rgba(248,250,252,.86); border-radius: 16px; padding: 10px 12px; color: #334155; }
 .prop-type { width: 110px; }
@@ -378,5 +391,6 @@ function isChildEnabled(folder: any, childId: string) {
   .prop-val { background: rgba(30,41,59,.84); color: #cbd5e1; }
   .file-item, .child-name, .io-label, .flag-card { color: #cbd5e1; }
   .sidebar-tabs button.active { background: rgba(59,130,246,.18); border-color: rgba(59,130,246,.24); color: #bfdbfe; }
+  .runtime-config-hint { border-color: rgba(96, 165, 250, .45); background: rgba(30, 64, 175, .18); color: #bfdbfe; }
 }
 </style>

@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .state import append_trace, build_error_info, ensure_graph_state
-from .types import GraphNode, GraphState
+from .graph_types import GraphNode, GraphState
 
 SAFE_BUILTINS = {
     "abs": abs,
