@@ -8,6 +8,7 @@ from .routers import inbox as inbox_router
 from .routers import plugins as plugins_router
 from .routers import profile as profile_router
 from .routers import routing as routing_router
+from .routers import runtime as runtime_router
 from .routers import workspaces as workspaces_router
 from .seed import seed_initial_data
 
@@ -28,6 +29,7 @@ app.include_router(plugins_router.router)
 app.include_router(workspaces_router.router)
 app.include_router(routing_router.router)
 app.include_router(inbox_router.router)
+app.include_router(runtime_router.router)
 
 
 @app.on_event('startup')

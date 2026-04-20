@@ -37,3 +37,6 @@ output/
 **/node_modules/
 **/dist/
 **/coverage/
+
+# models
+/agent/models/**

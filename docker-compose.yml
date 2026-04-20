@@ -20,10 +20,15 @@ services:
       SECRET_KEY: dev-secret
       FRONTEND_ORIGINS: http://localhost:5173
       TOKENFLOW_STORAGE_DIR: /app/storage
+      TOKENFLOW_MODELS_DIR: /app/models
+      TOKENFLOW_RUNTIME_TIMEOUT_SECONDS: 20
+      TOKENFLOW_RUNTIME_MAX_CONCURRENCY: 2
+      TOKENFLOW_RUNTIME_MODEL_BACKEND: llama-cpp-python
     ports:
       - "8000:8000"
     volumes:
       - ./backend/storage:/app/storage
+      - ./models:/app/models:ro
 
 volumes:
   pg_data:
