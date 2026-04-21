@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: tokenflow
       POSTGRES_USER: postgres
@@ -24,6 +24,11 @@ services:
       TOKENFLOW_RUNTIME_TIMEOUT_SECONDS: 20
       TOKENFLOW_RUNTIME_MAX_CONCURRENCY: 2
       TOKENFLOW_RUNTIME_MODEL_BACKEND: llama-cpp-python
+      TOKENFLOW_RAG_VECTOR_DIM: 256
+      TOKENFLOW_RAG_CHUNK_SIZE: 700
+      TOKENFLOW_RAG_CHUNK_OVERLAP: 120
+      TOKENFLOW_RAG_DEFAULT_TOP_K: 5
+      TOKENFLOW_RAG_CACHE_TTL_SECONDS: 900
     ports:
       - "8000:8000"
     volumes:

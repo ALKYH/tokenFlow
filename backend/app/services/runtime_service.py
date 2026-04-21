@@ -41,6 +41,22 @@ def _env_int(name: str, default: int, minimum: int = 1) -> int:
     return max(minimum, value)
 
 
+def _env_float(name: str, default: float, minimum: float) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+
 def _resolve_models_dir() -> Path:
     configured = os.environ.get('TOKENFLOW_MODELS_DIR', 'models')
     path = Path(configured).expanduser()
@@ -110,8 +126,10 @@ TOKENFLOW_RUNTIME_TEMP_DIR = _resolve_runtime_temp_dir()
 TOKENFLOW_RUNTIME_AUDIT_LOG_PATH = _resolve_runtime_audit_log_path()
 TOKENFLOW_RUNTIME_ALLOWED_IMPORTS = _allowed_imports()
 TOKENFLOW_RUNTIME_ALLOWED_MODELS = _allowed_models()
+TOKENFLOW_RUNTIME_ALLOWED_MODELS_CONFIGURED = bool(os.environ.get('TOKENFLOW_RUNTIME_ALLOWED_MODELS', '').strip())
 TOKENFLOW_RUNTIME_DEFAULT_MODEL = os.environ.get('TOKENFLOW_RUNTIME_DEFAULT_MODEL', '').strip()
 TOKENFLOW_RUNTIME_MODEL_BACKEND = os.environ.get('TOKENFLOW_RUNTIME_MODEL_BACKEND', 'llama-cpp-python').strip() or 'llama-cpp-python'
+TOKENFLOW_RUNTIME_SUPPORTED_BACKENDS = {'llama-cpp-python', 'vllm'}
 TOKENFLOW_RUNTIME_TIMEOUT_SECONDS = _env_int('TOKENFLOW_RUNTIME_TIMEOUT_SECONDS', 20, minimum=1)
 TOKENFLOW_RUNTIME_MAX_CONCURRENCY = _env_int('TOKENFLOW_RUNTIME_MAX_CONCURRENCY', 2, minimum=1)
 TOKENFLOW_RUNTIME_MAX_QUEUE_LENGTH = _env_int('TOKENFLOW_RUNTIME_MAX_QUEUE_LENGTH', 16, minimum=1)
@@ -122,6 +140,9 @@ TOKENFLOW_RUNTIME_MAX_RESOURCE_BYTES = _env_int('TOKENFLOW_RUNTIME_MAX_RESOURCE_
 TOKENFLOW_RUNTIME_MAX_OUTPUT_CHARS = _env_int('TOKENFLOW_RUNTIME_MAX_OUTPUT_CHARS', 200000, minimum=256)
 TOKENFLOW_RUNTIME_MODEL_CTX = _env_int('TOKENFLOW_RUNTIME_MODEL_CTX', 4096, minimum=256)
 TOKENFLOW_RUNTIME_MODEL_THREADS = _env_int('TOKENFLOW_RUNTIME_MODEL_THREADS', 4, minimum=1)
+TOKENFLOW_RUNTIME_VLLM_TENSOR_PARALLEL_SIZE = _env_int('TOKENFLOW_RUNTIME_VLLM_TENSOR_PARALLEL_SIZE', 1, minimum=1)
+TOKENFLOW_RUNTIME_VLLM_GPU_MEMORY_UTILIZATION = _env_float('TOKENFLOW_RUNTIME_VLLM_GPU_MEMORY_UTILIZATION', 0.90, minimum=0.1)
+TOKENFLOW_RUNTIME_VLLM_TRUST_REMOTE_CODE = _env_bool('TOKENFLOW_RUNTIME_VLLM_TRUST_REMOTE_CODE', default=False)
 
 _RUNTIME_EXECUTOR = ThreadPoolExecutor(
     max_workers=TOKENFLOW_RUNTIME_MAX_CONCURRENCY,
@@ -373,6 +394,32 @@ def _resolve_model_path(model_name: str) -> Path:
     return resolved
 
 
+def _validate_runtime_backend():
+    if TOKENFLOW_RUNTIME_MODEL_BACKEND not in TOKENFLOW_RUNTIME_SUPPORTED_BACKENDS:
+        raise RuntimeExecutionError(
+            'INVALID_REQUEST',
+            f'Unsupported runtime backend: {TOKENFLOW_RUNTIME_MODEL_BACKEND}',
+            detail={'supported_backends': sorted(TOKENFLOW_RUNTIME_SUPPORTED_BACKENDS)}
+        )
+
+
+def _validate_vllm_model_name(model_name: str):
+    if not model_name:
+        raise RuntimeExecutionError('MODEL_NOT_ALLOWED', 'Model name is required')
+    if len(model_name) > 255:
+        raise RuntimeExecutionError('MODEL_NOT_ALLOWED', 'Model name is too long')
+    if '\x00' in model_name:
+        raise RuntimeExecutionError('MODEL_NOT_ALLOWED', 'Model name contains invalid null byte')
+    if TOKENFLOW_RUNTIME_ALLOWED_MODELS_CONFIGURED and model_name not in TOKENFLOW_RUNTIME_ALLOWED_MODELS:
+        raise RuntimeExecutionError('MODEL_NOT_ALLOWED', f'Model "{model_name}" is not in runtime whitelist')
+    if not TOKENFLOW_RUNTIME_ALLOWED_MODELS_CONFIGURED and TOKENFLOW_RUNTIME_DEFAULT_MODEL and model_name != TOKENFLOW_RUNTIME_DEFAULT_MODEL:
+        raise RuntimeExecutionError(
+            'MODEL_NOT_ALLOWED',
+            f'Model "{model_name}" is not allowed when whitelist is empty',
+            detail={'allowed': [TOKENFLOW_RUNTIME_DEFAULT_MODEL]}
+        )
+
+
 def _load_llama_model(model_name: str):
     _validate_model_name(model_name)
     if model_name not in TOKENFLOW_RUNTIME_ALLOWED_MODELS:
@@ -400,7 +447,68 @@ def _load_llama_model(model_name: str):
         return model
 
 
+def _load_vllm_engine(model_name: str):
+    _validate_vllm_model_name(model_name)
+    cache_key = f'vllm::{model_name}'
+    with _MODEL_CACHE_LOCK:
+        cached = _MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            from vllm import LLM  # type: ignore
+        except Exception as exc:
+            raise RuntimeExecutionError(
+                'RUNTIME_EXCEPTION',
+                'vllm is not installed',
+                detail={'dependency': 'vllm'}
+            ) from exc
+        try:
+            engine = LLM(
+                model=model_name,
+                tensor_parallel_size=TOKENFLOW_RUNTIME_VLLM_TENSOR_PARALLEL_SIZE,
+                trust_remote_code=TOKENFLOW_RUNTIME_VLLM_TRUST_REMOTE_CODE,
+                gpu_memory_utilization=TOKENFLOW_RUNTIME_VLLM_GPU_MEMORY_UTILIZATION
+            )
+        except Exception as exc:
+            raise RuntimeExecutionError('RUNTIME_EXCEPTION', 'Failed to initialize vLLM backend') from exc
+        _MODEL_CACHE[cache_key] = engine
+        return engine
+
+
+def _run_vllm_model(prompt: str, model_name: str | None = None, max_tokens: int = 256, temperature: float = 0.2):
+    selected = model_name or TOKENFLOW_RUNTIME_DEFAULT_MODEL
+    if not selected:
+        raise RuntimeExecutionError('INVALID_REQUEST', 'model is required when run_local_model is used')
+    engine = _load_vllm_engine(selected)
+    try:
+        from vllm import SamplingParams  # type: ignore
+    except Exception as exc:
+        raise RuntimeExecutionError(
+            'RUNTIME_EXCEPTION',
+            'vllm SamplingParams is unavailable',
+            detail={'dependency': 'vllm'}
+        ) from exc
+    sampling = SamplingParams(max_tokens=max_tokens, temperature=temperature)
+    try:
+        outputs = engine.generate([str(prompt)], sampling_params=sampling, use_tqdm=False)
+    except Exception as exc:
+        raise RuntimeExecutionError('RUNTIME_EXCEPTION', 'vLLM inference failed') from exc
+    try:
+        return outputs[0].outputs[0].text
+    except Exception:
+        return outputs
+
+
 def _run_local_model(prompt: str, model_name: str | None = None, max_tokens: int = 256, temperature: float = 0.2):
+    _validate_runtime_backend()
+    if TOKENFLOW_RUNTIME_MODEL_BACKEND == 'vllm':
+        return _run_vllm_model(
+            prompt=prompt,
+            model_name=model_name,
+            max_tokens=max_tokens,
+            temperature=temperature
+        )
+
     selected = model_name or TOKENFLOW_RUNTIME_DEFAULT_MODEL
     if not selected:
         raise RuntimeExecutionError('INVALID_REQUEST', 'model is required when run_local_model is used')
@@ -470,6 +578,44 @@ def _build_exec_scope(
         runtime_checkpoint()
         return _run_local_model(prompt=prompt, model_name=model, **kwargs)
 
+    def runtime_rag_search(
+        query: str,
+        workspace_id: str = 'default',
+        top_k: int = 5,
+        rerank: bool = True,
+        max_context_chars: int = 2400
+    ):
+        runtime_checkpoint()
+        from .rag_service import runtime_search
+        return asyncio.run(
+            runtime_search(
+                workspace_id=workspace_id,
+                query=query,
+                top_k=top_k,
+                rerank=rerank,
+                max_context_chars=max_context_chars
+            )
+        )
+
+    def runtime_rag_ingest(
+        content: str,
+        workspace_id: str = 'default',
+        title: str = '',
+        source_uri: str = '',
+        metadata: dict[str, Any] | None = None
+    ):
+        runtime_checkpoint()
+        from .rag_service import runtime_ingest_text
+        return asyncio.run(
+            runtime_ingest_text(
+                workspace_id=workspace_id,
+                content=content,
+                title=title,
+                source_uri=source_uri,
+                metadata=metadata or {}
+            )
+        )
+
     safe_builtins: dict[str, Any] = {
         'abs': abs,
         'all': all,
@@ -510,6 +656,8 @@ def _build_exec_scope(
         'node_env': payload.env,
         'node_resources': resources,
         'run_local_model': runtime_model,
+        'rag_search': runtime_rag_search,
+        'rag_ingest_text': runtime_rag_ingest,
         'runtime_context': context,
         'runtime_cancelled': runtime_cancelled,
         'runtime_checkpoint': runtime_checkpoint
@@ -685,6 +833,7 @@ async def execute_node(payload: NodeExecutionRequest, requestor: str | None = No
     model_name = _extract_model_name(payload)
     try:
         _validate_protocol_version(payload.protocol_version)
+        _validate_runtime_backend()
         if payload.execution_mode not in {'python-module', 'builtin', 'auto'}:
             raise RuntimeExecutionError('INVALID_REQUEST', f'Unsupported execution_mode: {payload.execution_mode}')
         _reserve_queue_slot()
@@ -792,8 +941,6 @@ def _list_models() -> list[str]:
 
 
 def _check_llama_cpp_available() -> bool:
-    if TOKENFLOW_RUNTIME_MODEL_BACKEND != 'llama-cpp-python':
-        return False
     try:
         import llama_cpp  # noqa: F401
         return True
@@ -801,7 +948,26 @@ def _check_llama_cpp_available() -> bool:
         return False
 
 
+def _check_vllm_available() -> bool:
+    try:
+        import vllm  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _list_vllm_models() -> list[str]:
+    if TOKENFLOW_RUNTIME_ALLOWED_MODELS_CONFIGURED and TOKENFLOW_RUNTIME_ALLOWED_MODELS:
+        return sorted(TOKENFLOW_RUNTIME_ALLOWED_MODELS)
+    if TOKENFLOW_RUNTIME_DEFAULT_MODEL:
+        return [TOKENFLOW_RUNTIME_DEFAULT_MODEL]
+    return []
+
+
 def get_runtime_capabilities() -> list[NodeCapability]:
+    llm_desc = 'Local GGUF inference via llama-cpp-python.'
+    if TOKENFLOW_RUNTIME_MODEL_BACKEND == 'vllm':
+        llm_desc = 'Inference via vLLM backend (GPU recommended).'
     return [
         NodeCapability(
             node_type='runtime',
@@ -818,11 +984,22 @@ def get_runtime_capabilities() -> list[NodeCapability]:
         NodeCapability(
             node_type='llm',
             execution_mode='python-module',
-            description='Local GGUF inference via llama-cpp-python.',
+            description=llm_desc,
             outputs=['text'],
             default_attributes={
                 'backend': TOKENFLOW_RUNTIME_MODEL_BACKEND,
                 'default_model': TOKENFLOW_RUNTIME_DEFAULT_MODEL
+            },
+            supports_python_module=True
+        ),
+        NodeCapability(
+            node_type='rag',
+            execution_mode='python-module',
+            description='PostgreSQL + pgvector retrieval helper via rag_search()/rag_ingest_text().',
+            outputs=['hits', 'context', 'metrics'],
+            default_attributes={
+                'default_top_k': 5,
+                'cache_ttl_seconds': os.environ.get('TOKENFLOW_RAG_CACHE_TTL_SECONDS', '900')
             },
             supports_python_module=True
         )
@@ -830,12 +1007,17 @@ def get_runtime_capabilities() -> list[NodeCapability]:
 
 
 def get_runtime_health() -> RuntimeHealth:
-    models = _list_models()
+    models = _list_models() if TOKENFLOW_RUNTIME_MODEL_BACKEND == 'llama-cpp-python' else _list_vllm_models()
     dependencies = {
-        'llama_cpp_available': _check_llama_cpp_available()
+        'llama_cpp_available': _check_llama_cpp_available(),
+        'vllm_available': _check_vllm_available()
     }
     status = 'ok'
-    if TOKENFLOW_RUNTIME_MODEL_BACKEND == 'llama-cpp-python' and not dependencies['llama_cpp_available']:
+    if TOKENFLOW_RUNTIME_MODEL_BACKEND not in TOKENFLOW_RUNTIME_SUPPORTED_BACKENDS:
+        status = 'degraded'
+    elif TOKENFLOW_RUNTIME_MODEL_BACKEND == 'llama-cpp-python' and not dependencies['llama_cpp_available']:
+        status = 'degraded'
+    elif TOKENFLOW_RUNTIME_MODEL_BACKEND == 'vllm' and not dependencies['vllm_available']:
         status = 'degraded'
     limits = {
         'timeout_seconds': TOKENFLOW_RUNTIME_TIMEOUT_SECONDS,
@@ -850,7 +1032,13 @@ def get_runtime_health() -> RuntimeHealth:
         'audit_log_path': str(TOKENFLOW_RUNTIME_AUDIT_LOG_PATH),
         'pending_tasks': _RUNTIME_PENDING,
         'allowed_models': sorted(TOKENFLOW_RUNTIME_ALLOWED_MODELS),
-        'allowed_imports': sorted(TOKENFLOW_RUNTIME_ALLOWED_IMPORTS)
+        'allowed_imports': sorted(TOKENFLOW_RUNTIME_ALLOWED_IMPORTS),
+        'supported_backends': sorted(TOKENFLOW_RUNTIME_SUPPORTED_BACKENDS),
+        'vllm': {
+            'tensor_parallel_size': TOKENFLOW_RUNTIME_VLLM_TENSOR_PARALLEL_SIZE,
+            'gpu_memory_utilization': TOKENFLOW_RUNTIME_VLLM_GPU_MEMORY_UTILIZATION,
+            'trust_remote_code': TOKENFLOW_RUNTIME_VLLM_TRUST_REMOTE_CODE
+        }
     }
     return RuntimeHealth(
         status=status,

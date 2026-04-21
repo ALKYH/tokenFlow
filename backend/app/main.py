@@ -1,12 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import FRONTEND_ORIGINS
-from .db.session import create_db_and_tables, ensure_runtime_schema
+from .db.session import create_db_and_tables, ensure_rag_schema, ensure_runtime_schema
 from . import models  # noqa: F401
 from .routers import auth as auth_router
 from .routers import inbox as inbox_router
 from .routers import plugins as plugins_router
 from .routers import profile as profile_router
+from .routers import rag as rag_router
 from .routers import routing as routing_router
 from .routers import runtime as runtime_router
 from .routers import workspaces as workspaces_router
@@ -30,12 +31,14 @@ app.include_router(workspaces_router.router)
 app.include_router(routing_router.router)
 app.include_router(inbox_router.router)
 app.include_router(runtime_router.router)
+app.include_router(rag_router.router)
 
 
 @app.on_event('startup')
 async def on_startup():
     await create_db_and_tables()
     await ensure_runtime_schema()
+    await ensure_rag_schema()
     await seed_initial_data()
 
 

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import sys
 
 import pytest
+
+# Allow running this file directly (for example from IDE Code Runner) while
+# preserving normal pytest package imports.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 pytest.importorskip("langgraph")
 
@@ -104,4 +112,3 @@ def test_parallel_execution_has_isolated_state() -> None:
     assert [result for result, _, _ in results] == [f"{i}-done" for i in range(20)]
     assert [logs for _, logs, _ in results] == [[f"[print] {i}-done"] for i in range(20)]
     assert all(trace_count == 9 for _, _, trace_count in results)
-

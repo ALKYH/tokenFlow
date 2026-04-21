@@ -97,7 +97,7 @@
           id: n.id,
           label: n.label || n.id,
           status: (n as any).status || 'idle',
-          value: n.lastResult
+          value: extractNodeOutput(n.lastResult)
         }))
     );
     const workspaceSuggestions = computed(() => {
@@ -135,10 +135,50 @@
     function onRemoveIO(payload: { side: 'in' | 'out'; idx: number }) {
       removeNodeIO(selectedNodeId.value, payload.side, payload.idx);
     }
-    type FrontendExecutionMode = 'pyodide' | 'runtime';
+    type FrontendExecutionMode = 'pyodide' | 'runtime' | 'builtin';
+    type FrontendExecutionStatus = 'ok' | 'failed';
+    type FrontendExecutionError = {
+      code?: string;
+      message: string;
+      detail?: any;
+      traceback?: string;
+    };
+    type FrontendExecutionTraceEntry = {
+      node_id: string;
+      phase: string;
+      status: string;
+      detail?: string;
+    };
+    type FrontendExecutionResult = {
+      mode: FrontendExecutionMode;
+      status: FrontendExecutionStatus;
+      output: any;
+      logs: string[];
+      error: FrontendExecutionError | null;
+      metrics: Record<string, any>;
+      durationMs: number;
+      trace: FrontendExecutionTraceEntry[];
+    };
+    type NodeObservabilityEvent = {
+      id: string;
+      run_id: string;
+      node_id: string;
+      node_label: string;
+      mode: FrontendExecutionMode | 'workflow';
+      phase: string;
+      status: string;
+      detail?: string;
+      duration_ms?: number;
+      ts: string;
+    };
+    type RunNodeOptions = {
+      allowRuntimeFallbackPrompt?: boolean;
+      runId?: string;
+    };
     // let capturedEl: HTMLElement | null = null; // reserved for future use
     const hoverPort = ref<{ nodeId: string; type: 'in' | 'out'; index: number; invalid?: boolean } | null>(null);
     const debugLogs = reactive<string[]>([]);
+    const pyNodeOutputBuffer = reactive<Record<string, any>>({});
     const pyodide = ref<any>(null);
     const pyReady = ref(false);
     const pyCode = ref(`print("hello from pyodide")`);
@@ -154,6 +194,8 @@
       { key: 'EMBEDDING_API_KEY', value: '', secret: true }
     ]);
     const savedNodeTemplates = ref<any[]>([]);
+    const nodeObservabilityEvents = reactive<NodeObservabilityEvent[]>([]);
+    const activeRunId = ref('');
     const cloudModuleCount = ref(0);
     const cloudWorkspaces = ref<any[]>([]);
     const cloudWorkspacesLoading = ref(false);
@@ -211,6 +253,82 @@
       try { console.debug(...args); } catch (e) {}
     }
 
+    function createRunId(scope: 'single' | 'graph') {
+      return `${scope}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    }
+
+    function pushNodeEvent(entry: Omit<NodeObservabilityEvent, 'id' | 'ts'>) {
+      nodeObservabilityEvents.unshift({
+        ...entry,
+        id: `${entry.run_id}_${entry.node_id}_${entry.phase}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        ts: new Date().toISOString()
+      });
+      if (nodeObservabilityEvents.length > 500) nodeObservabilityEvents.splice(500);
+    }
+
+    function getNodeExecutionMode(node: Node): FrontendExecutionMode {
+      if (node.category === 'note' || isBuiltinNode(node.category)) return 'builtin';
+      return resolveNodeExecutionMode(node);
+    }
+
+    function emitNodeEvent(
+      node: Node,
+      phase: string,
+      status: string,
+      options: { runId?: string; mode?: FrontendExecutionMode | 'workflow'; detail?: string; durationMs?: number } = {}
+    ) {
+      const runId = options.runId || activeRunId.value || createRunId('single');
+      if (!activeRunId.value) activeRunId.value = runId;
+      pushNodeEvent({
+        run_id: runId,
+        node_id: node.id,
+        node_label: node.label || node.id,
+        mode: options.mode || getNodeExecutionMode(node),
+        phase,
+        status,
+        detail: options.detail,
+        duration_ms: options.durationMs
+      });
+    }
+
+    function emitWorkflowEvent(runId: string, phase: string, status: string, detail?: string) {
+      pushNodeEvent({
+        run_id: runId,
+        node_id: '__workflow__',
+        node_label: 'Workflow',
+        mode: 'workflow',
+        phase,
+        status,
+        detail
+      });
+    }
+
+    function emitTraceEvents(
+      node: Node,
+      trace: FrontendExecutionTraceEntry[],
+      options: { runId?: string; mode?: FrontendExecutionMode } = {}
+    ) {
+      if (!Array.isArray(trace) || !trace.length) return;
+      for (const item of trace) {
+        emitNodeEvent(node, item.phase, item.status, {
+          runId: options.runId,
+          mode: options.mode,
+          detail: item.detail
+        });
+      }
+    }
+
+    function beginExecutionRun(scope: 'single' | 'graph', detail?: string) {
+      const runId = createRunId(scope);
+      activeRunId.value = runId;
+      emitWorkflowEvent(runId, scope === 'graph' ? 'graph_start' : 'single_start', 'running', detail);
+      return runId;
+    }
+
+    function endExecutionRun(runId: string, status: 'ok' | 'error' | 'skipped', detail?: string) {
+      emitWorkflowEvent(runId, 'finish', status, detail);
+    }
+
     const PYTHON_KEYWORDS = new Set([
       'False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del',
       'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal',
@@ -225,8 +343,51 @@
       return name;
     }
 
+    function isFrontendExecutionResult(value: any): value is FrontendExecutionResult {
+      return (
+        !!value &&
+        typeof value === 'object' &&
+        (value as any).mode &&
+        ((value as any).mode === 'runtime' || (value as any).mode === 'pyodide' || (value as any).mode === 'builtin') &&
+        typeof (value as any).status === 'string' &&
+        'output' in (value as any)
+      );
+    }
+
+    function buildExecutionResult(
+      mode: FrontendExecutionMode,
+      status: FrontendExecutionStatus,
+      output: any,
+      options: {
+        logs?: string[];
+        error?: FrontendExecutionError | null;
+        metrics?: Record<string, any>;
+        trace?: FrontendExecutionTraceEntry[];
+      } = {}
+    ): FrontendExecutionResult {
+      const metrics = options.metrics && typeof options.metrics === 'object' ? { ...options.metrics } : {};
+      const durationRaw = Number((metrics as any).duration_ms || 0);
+      return {
+        mode,
+        status,
+        output,
+        logs: Array.isArray(options.logs) ? options.logs : [],
+        error: options.error || null,
+        metrics,
+        durationMs: Number.isFinite(durationRaw) ? durationRaw : 0,
+        trace: Array.isArray(options.trace) ? options.trace : []
+      };
+    }
+
+    function applyNodeExecutionResult(node: Node, result: FrontendExecutionResult) {
+      node.lastResult = result;
+      (node as any).meta = (node as any).meta || {};
+      (node as any).meta.lastExecution = result;
+    }
+
     function extractNodeOutput(value: any) {
-      if (value && typeof value === 'object' && (value as any).mode === 'runtime' && 'output' in (value as any)) {
+      if (isFrontendExecutionResult(value)) return value.output;
+      if (value && typeof value === 'object' && 'output' in (value as any) && 'mode' in (value as any)) {
         return (value as any).output;
       }
       return value;
@@ -351,36 +512,126 @@
       return payload;
     }
 
-    async function runNodeViaRuntime(node: Node, inputs: any[]) {
+    async function runNodeViaRuntime(node: Node, inputs: any[]): Promise<FrontendExecutionResult> {
       const requestPayload = await buildRuntimeExecutionRequest(node, inputs);
       const response: NodeExecutionResponse = await executeRuntimeNode(requestPayload);
-      const runtimeResult = {
-        mode: 'runtime',
-        status: response.status,
-        output: response.output,
-        logs: response.logs || [],
-        error: response.error || null,
-        metrics: response.metrics || {},
-        durationMs: Number(response.metrics?.duration_ms || 0),
-        trace: response.trace || []
-      };
+      const runtimeResult = buildExecutionResult(
+        'runtime',
+        response.status === 'ok' ? 'ok' : 'failed',
+        response.output,
+        {
+          logs: response.logs || [],
+          error: response.error || null,
+          metrics: response.metrics || {},
+          trace: (response.trace || []).map(item => ({
+            node_id: item.node_id,
+            phase: item.phase,
+            status: item.status,
+            detail: item.detail
+          }))
+        }
+      );
 
-      node.lastResult = runtimeResult;
-      (node as any).meta = (node as any).meta || {};
-      (node as any).meta.lastExecution = runtimeResult;
+      applyNodeExecutionResult(node, runtimeResult);
 
       if (runtimeResult.logs.length) {
         for (const line of runtimeResult.logs) {
           logDebug(`runtime ${node.id}: ${line}`);
         }
       }
-      if (response.status === 'ok') {
+      if (runtimeResult.status === 'ok') {
         logDebug('runtime node executed', node.id, `duration=${runtimeResult.durationMs}ms`);
         try { (node as any).status = 'done'; } catch (e) {}
-        return;
+      } else {
+        logDebug('runtime node failed', node.id, runtimeResult.error?.code || 'UNKNOWN', runtimeResult.error?.message || '');
+        try { (node as any).status = 'error'; } catch (e) {}
       }
-      logDebug('runtime node failed', node.id, response.error?.code || 'UNKNOWN', response.error?.message || '');
-      try { (node as any).status = 'error'; } catch (e) {}
+      return runtimeResult;
+    }
+
+    async function runNodeViaPyodide(node: Node, inputs: any[]): Promise<FrontendExecutionResult> {
+      const nodeId = node.id;
+      if (!pyReady.value) {
+        logDebug('pyodide not ready yet');
+        const result = buildExecutionResult('pyodide', 'failed', null, {
+          error: { code: 'PYODIDE_NOT_READY', message: 'Pyodide is not ready yet.' },
+          metrics: { duration_ms: 0 },
+          trace: [{ node_id: nodeId, phase: 'prepare', status: 'error', detail: 'pyodide not ready' }]
+        });
+        applyNodeExecutionResult(node, result);
+        try { (node as any).status = 'idle'; } catch (e) {}
+        return result;
+      }
+
+      const startedAt = Date.now();
+      try {
+        delete pyNodeOutputBuffer[nodeId];
+        try { pyodide.value.globals.set('__node_args', inputs); } catch (e) { /* ignore */ }
+        const userCode = (node as any).code || '';
+        const paramNames: string[] = (node.inputs && node.inputs.length) ? node.inputs.map((nm, i) => sanitizePythonName(nm, i)) : [];
+        const pyParts: string[] = [];
+        const safeFuncName = `__node_exec_${String(node.id).replace(/[^0-9a-zA-Z_]/g, '_')}`;
+        pyParts.push(`def ${safeFuncName}(__node_args):`);
+        for (let i = 0; i < paramNames.length; i++) {
+          pyParts.push(`    ${paramNames[i]} = __node_args[${i}]`);
+        }
+        const userLines = (userCode || 'res = None').split('\n');
+        for (const ln of userLines) {
+          pyParts.push('    ' + ln);
+        }
+        pyParts.push('    try:');
+        pyParts.push('        return res');
+        pyParts.push('    except NameError:');
+        pyParts.push('        return None');
+        pyParts.push(`out = ${safeFuncName}(__node_args)`);
+        pyParts.push('import json');
+        pyParts.push('from js import setNodeResult');
+        pyParts.push(`setNodeResult(${JSON.stringify(node.id)}, json.dumps(out, default=str))`);
+        const inner = pyParts.join('\n');
+        const wrapped = `\nimport sys\nfrom js import pushDebug, setNodeResult\nclass _W:\n    def write(self,s):\n        try:\n            if s is None: return\n            s2 = str(s)\n            if s2.strip():\n                pushDebug(s2)\n        except Exception as e:\n            pass\n    def flush(self):\n        pass\nsys.stdout = _W()\nsys.stderr = _W()\ntry:\n${inner.split('\n').map(line=> '    ' + line).join('\n')}\nexcept Exception as _e:\n    pushDebug('py exception: ' + str(_e))\n    raise\n`;
+        await pyodide.value.runPythonAsync(wrapped);
+        const output = Object.prototype.hasOwnProperty.call(pyNodeOutputBuffer, nodeId)
+          ? pyNodeOutputBuffer[nodeId]
+          : extractNodeOutput(node.lastResult);
+        delete pyNodeOutputBuffer[nodeId];
+        const result = buildExecutionResult('pyodide', 'ok', output, {
+          metrics: { duration_ms: Math.max(0, Date.now() - startedAt) },
+          trace: [
+            { node_id: nodeId, phase: 'prepare', status: 'ok' },
+            { node_id: nodeId, phase: 'run', status: 'ok' },
+            { node_id: nodeId, phase: 'postprocess', status: 'ok' }
+          ]
+        });
+        applyNodeExecutionResult(node, result);
+        logDebug('runNode executed', nodeId);
+        try { (node as any).status = 'done'; } catch (e) {}
+        return result;
+      } catch (err: any) {
+        delete pyNodeOutputBuffer[nodeId];
+        const message = err?.message || (err?.toString ? err.toString() : String(err));
+        logDebug('runNode py error: ' + message);
+        const result = buildExecutionResult('pyodide', 'failed', null, {
+          error: { code: 'PYODIDE_EXCEPTION', message },
+          metrics: { duration_ms: Math.max(0, Date.now() - startedAt) },
+          trace: [
+            { node_id: nodeId, phase: 'prepare', status: 'ok' },
+            { node_id: nodeId, phase: 'run', status: 'error', detail: message }
+          ]
+        });
+        applyNodeExecutionResult(node, result);
+        try { (node as any).status = 'error'; } catch (e) {}
+        return result;
+      }
+    }
+
+    function shouldFallbackToPyodide(node: Node, runtimeResult: FrontendExecutionResult): boolean {
+      const hint = runtimeResult.error?.message || runtimeResult.error?.code || 'unknown runtime error';
+      const nodeName = node.label || node.id;
+      try {
+        return window.confirm(`[${nodeName}] Runtime failed: ${hint}\nSwitch this node to Pyodide and retry now?`);
+      } catch (e) {
+        return false;
+      }
     }
 
     async function ensureHighlighter() {
@@ -458,14 +709,14 @@
     // expose a helper for Python to write back node results as JSON string
     (window as any).setNodeResult = (nodeId: string, jsonStr: string) => {
       try {
+        let parsedResult: any = jsonStr;
+        try {
+          parsedResult = JSON.parse(jsonStr);
+        } catch (e) {}
+        pyNodeOutputBuffer[nodeId] = parsedResult;
         const n = nodes.find(x => x.id === nodeId as string);
         if (n) {
-          try {
-            // try parse JSON, fallback to raw string
-            n.lastResult = JSON.parse(jsonStr);
-          } catch (e) {
-            n.lastResult = jsonStr;
-          }
+          n.lastResult = parsedResult;
         }
         debugLogs.unshift(`${new Date().toISOString()} setNodeResult ${nodeId} ` + String(jsonStr));
         if (debugLogs.length > 120) debugLogs.pop();
@@ -555,6 +806,15 @@
       updateNodeMetaConfig(id, String(configText || '{}'));
     }
 
+    function handleUpdateExecutionModeOverride(mode: 'inherit' | 'runtime' | 'pyodide') {
+      const id = selectedNodeId.value || '';
+      if (!id) {
+        logDebug('handleUpdateExecutionModeOverride: no node selected');
+        return;
+      }
+      updateNodeExecutionModeOverride(id, mode);
+    }
+
     function handleAttachNodeFiles(payload: { files: File[] }) {
       const id = selectedNodeId.value || '';
       if (!id) {
@@ -579,10 +839,18 @@
       updateNodeNote(id, note);
     }
 
-    function handleRunSelectedNode() {
+    async function handleRunSelectedNode() {
       const id = selectedNodeId.value || '';
       if (!id) { logDebug('handleRunSelectedNode: no node selected'); return; }
-      runNode(id).catch(e => logDebug('runNode threw', e?.toString ? e.toString() : e));
+      const runId = beginExecutionRun('single', `node=${id}`);
+      try {
+        await runNode(id, { allowRuntimeFallbackPrompt: true, runId });
+        const current = nodes.find(n => n.id === id);
+        endExecutionRun(runId, (current as any)?.status === 'error' ? 'error' : 'ok', `node=${id}`);
+      } catch (e: any) {
+        logDebug('runNode threw', e?.toString ? e.toString() : e);
+        endExecutionRun(runId, 'error', e?.message || String(e));
+      }
     }
 
     function handleInsertTemplate() {
@@ -610,12 +878,15 @@
       }
     }
 
-    async function runNode(nodeId: string) {
+    async function runNode(nodeId: string, options: RunNodeOptions = {}) {
       const node = nodes.find(n => n.id === nodeId);
       if (!node) {
         logDebug('node not found', nodeId);
         return;
       }
+      const runId = options.runId || activeRunId.value || createRunId('single');
+      if (!activeRunId.value) activeRunId.value = runId;
+      emitNodeEvent(node, 'start', 'running', { runId });
       // if this node is a folded-folder representative, run its backup subgraph instead
       try {
         const folder = folders.find((f: any) => f._foldedNodeId === nodeId);
@@ -727,13 +998,45 @@
           const wrapped = `\nimport sys\nfrom js import pushDebug\nclass _W:\n    def write(self,s):\n        try:\n            if s is None: return\n            s2 = str(s)\n            if s2.strip():\n                pushDebug(s2)\n        except Exception as e:\n            pass\n    def flush(self):\n        pass\nsys.stdout = _W()\nsys.stderr = _W()\n\ndef __fold_exec(__node_args):\n${foldedParamNames.map((p, i) => `    ${p} = __node_args[${i}]`).join('\n')}\n${inner.map(line => '    ' + line).join('\n')}\n\ntry:\n    __fold_exec(__node_args)\nexcept Exception as _e:\n    pushDebug('folded py exception: ' + str(_e))\n    raise\n`;
 
           try {
+            const startedAt = Date.now();
             try { pyodide.value.globals.set('__node_args', inputsArray); } catch (e) {}
             await pyodide.value.runPythonAsync(wrapped);
+            const output = Object.prototype.hasOwnProperty.call(pyNodeOutputBuffer, nodeId)
+              ? pyNodeOutputBuffer[nodeId]
+              : extractNodeOutput(node.lastResult);
+            delete pyNodeOutputBuffer[nodeId];
+            const foldedResult = buildExecutionResult('pyodide', 'ok', output, {
+              metrics: { duration_ms: Math.max(0, Date.now() - startedAt) },
+              trace: [
+                { node_id: nodeId, phase: 'prepare', status: 'ok', detail: 'folded graph' },
+                { node_id: nodeId, phase: 'run', status: 'ok' },
+                { node_id: nodeId, phase: 'postprocess', status: 'ok' }
+              ]
+            });
+            applyNodeExecutionResult(node, foldedResult);
             try { (node as any).status = 'done'; } catch (e) {}
+            emitTraceEvents(node, foldedResult.trace, { runId, mode: 'pyodide' });
+            emitNodeEvent(node, 'finish', 'ok', {
+              runId,
+              mode: 'pyodide',
+              durationMs: foldedResult.durationMs
+            });
             return;
           } catch (err: any) {
             logDebug('folded run error', err?.toString ? err.toString() : err);
+            const foldedFailed = buildExecutionResult('pyodide', 'failed', null, {
+              error: { code: 'PYODIDE_EXCEPTION', message: err?.message || String(err) },
+              metrics: { duration_ms: 0 },
+              trace: [{ node_id: nodeId, phase: 'run', status: 'error', detail: err?.message || String(err) }]
+            });
+            applyNodeExecutionResult(node, foldedFailed);
             try { (node as any).status = 'error'; } catch (e) {}
+            emitTraceEvents(node, foldedFailed.trace, { runId, mode: 'pyodide' });
+            emitNodeEvent(node, 'finish', 'error', {
+              runId,
+              mode: 'pyodide',
+              detail: foldedFailed.error?.message || 'folded graph failed'
+            });
             return;
           }
       }
@@ -743,6 +1046,8 @@
         if (isNodeDisabled(node)) {
           logDebug('runNode skipped (node disabled)', nodeId);
           try { (node as any).status = 'disabled'; } catch (e) {}
+          emitNodeEvent(node, 'prepare', 'skipped', { runId, detail: 'node disabled by folder' });
+          emitNodeEvent(node, 'finish', 'skipped', { runId, detail: 'node disabled by folder' });
           return;
         }
       } catch (e) {}
@@ -761,88 +1066,126 @@
           }
         }
       }
+      emitNodeEvent(node, 'prepare', 'ok', { runId, detail: `inputs=${inputs.length}` });
       if (isBuiltinNode(node.category)) {
+        const startedAt = Date.now();
         try {
           const output = await runBuiltinNode(node, inputs, envVars);
-          node.lastResult = output;
+          const builtinResult = buildExecutionResult('builtin', 'ok', output, {
+            metrics: { duration_ms: Math.max(0, Date.now() - startedAt) },
+            trace: [
+              { node_id: node.id, phase: 'run', status: 'ok' },
+              { node_id: node.id, phase: 'postprocess', status: 'ok' }
+            ]
+          });
+          applyNodeExecutionResult(node, builtinResult);
+          emitTraceEvents(node, builtinResult.trace, { runId, mode: 'builtin' });
+          emitNodeEvent(node, 'finish', 'ok', {
+            runId,
+            mode: 'builtin',
+            durationMs: builtinResult.durationMs
+          });
           logDebug('runBuiltinNode executed', nodeId);
           try { (node as any).status = 'done'; } catch (e) {}
         } catch (err: any) {
           logDebug('runBuiltinNode error: ' + (err?.toString ? err.toString() : String(err)));
-          node.lastResult = { error: err?.message || String(err) };
+          const message = err?.message || String(err);
+          const builtinFailed = buildExecutionResult('builtin', 'failed', null, {
+            error: { code: 'BUILTIN_NODE_ERROR', message },
+            metrics: { duration_ms: Math.max(0, Date.now() - startedAt) },
+            trace: [{ node_id: node.id, phase: 'run', status: 'error', detail: message }]
+          });
+          applyNodeExecutionResult(node, builtinFailed);
+          emitTraceEvents(node, builtinFailed.trace, { runId, mode: 'builtin' });
+          emitNodeEvent(node, 'finish', 'error', {
+            runId,
+            mode: 'builtin',
+            detail: message,
+            durationMs: builtinFailed.durationMs
+          });
           try { (node as any).status = 'error'; } catch (e) {}
         }
         return;
       }
       if (node.category === 'note') {
-        node.lastResult = { type: 'note', text: (node as any).meta?.note || '' };
+        const noteResult = buildExecutionResult('builtin', 'ok', { type: 'note', text: (node as any).meta?.note || '' }, {
+          metrics: { duration_ms: 0 },
+          trace: [
+            { node_id: node.id, phase: 'run', status: 'ok' },
+            { node_id: node.id, phase: 'postprocess', status: 'ok' }
+          ]
+        });
+        applyNodeExecutionResult(node, noteResult);
+        emitTraceEvents(node, noteResult.trace, { runId, mode: 'builtin' });
+        emitNodeEvent(node, 'finish', 'ok', { runId, mode: 'builtin' });
         try { (node as any).status = 'done'; } catch (e) {}
         return;
       }
       if (resolveNodeExecutionMode(node) === 'runtime') {
         try {
-          await runNodeViaRuntime(node, inputs);
+          const runtimeResult = await runNodeViaRuntime(node, inputs);
+          emitTraceEvents(node, runtimeResult.trace, { runId, mode: 'runtime' });
+          emitNodeEvent(node, 'finish', runtimeResult.status === 'ok' ? 'ok' : 'error', {
+            runId,
+            mode: 'runtime',
+            durationMs: runtimeResult.durationMs,
+            detail: runtimeResult.error?.message
+          });
+          if (runtimeResult.status === 'failed' && options.allowRuntimeFallbackPrompt) {
+            const shouldFallback = shouldFallbackToPyodide(node, runtimeResult);
+            if (shouldFallback) {
+              updateNodeExecutionModeOverride(node.id, 'pyodide');
+              window.$message?.warning('Runtime failed. Switched this node to Pyodide and retried.');
+              emitNodeEvent(node, 'fallback', 'running', { runId, mode: 'pyodide', detail: 'runtime -> pyodide' });
+              const fallbackResult = await runNodeViaPyodide(node, inputs);
+              emitTraceEvents(node, fallbackResult.trace, { runId, mode: 'pyodide' });
+              emitNodeEvent(node, 'finish', fallbackResult.status === 'ok' ? 'ok' : 'error', {
+                runId,
+                mode: 'pyodide',
+                durationMs: fallbackResult.durationMs,
+                detail: fallbackResult.error?.message
+              });
+            }
+          }
         } catch (err: any) {
           logDebug('runNode runtime error: ' + (err?.toString ? err.toString() : String(err)));
-          node.lastResult = {
-            mode: 'runtime',
-            status: 'failed',
-            output: null,
-            logs: [],
+          const runtimeFailed = buildExecutionResult('runtime', 'failed', null, {
             error: { message: err?.message || String(err) },
             metrics: { duration_ms: 0 },
-            durationMs: 0,
-            trace: []
-          };
+            trace: [{ node_id: node.id, phase: 'run', status: 'error', detail: err?.message || String(err) }]
+          });
+          applyNodeExecutionResult(node, runtimeFailed);
+          emitTraceEvents(node, runtimeFailed.trace, { runId, mode: 'runtime' });
+          emitNodeEvent(node, 'finish', 'error', {
+            runId,
+            mode: 'runtime',
+            detail: runtimeFailed.error?.message
+          });
           try { (node as any).status = 'error'; } catch (e) {}
+          if (options.allowRuntimeFallbackPrompt && shouldFallbackToPyodide(node, runtimeFailed)) {
+            updateNodeExecutionModeOverride(node.id, 'pyodide');
+            window.$message?.warning('Runtime failed. Switched this node to Pyodide and retried.');
+            emitNodeEvent(node, 'fallback', 'running', { runId, mode: 'pyodide', detail: 'runtime -> pyodide' });
+            const fallbackResult = await runNodeViaPyodide(node, inputs);
+            emitTraceEvents(node, fallbackResult.trace, { runId, mode: 'pyodide' });
+            emitNodeEvent(node, 'finish', fallbackResult.status === 'ok' ? 'ok' : 'error', {
+              runId,
+              mode: 'pyodide',
+              durationMs: fallbackResult.durationMs,
+              detail: fallbackResult.error?.message
+            });
+          }
         }
         return;
       }
-      if (!pyReady.value) {
-        logDebug('pyodide not ready yet');
-        try { (node as any).status = 'idle'; } catch (e) {}
-        return;
-      }
-      try {
-        try { pyodide.value.globals.set('__node_args', inputs); } catch (e) { /* ignore */ }
-        const userCode = (node as any).code || '';
-        // build param name list (use provided input names or fallback arg0..)
-        const paramNames: string[] = (node.inputs && node.inputs.length) ? node.inputs.map((nm, i) => {
-          return sanitizePythonName(nm, i);
-        }) : [];
-        const pyParts: string[] = [];
-        // create a unique function wrapper so the user's code runs in a local scope
-        const safeFuncName = `__node_exec_${String(node.id).replace(/[^0-9a-zA-Z_]/g, '_')}`;
-        pyParts.push(`def ${safeFuncName}(__node_args):`);
-        // bind params from __node_args inside the function scope
-        for (let i = 0; i < paramNames.length; i++) {
-          pyParts.push(`    ${paramNames[i]} = __node_args[${i}]`);
-        }
-        // user code (body) - expects to set variable `res` to returnable value
-        const userLines = (userCode || 'res = None').split('\n');
-        for (const ln of userLines) {
-          pyParts.push('    ' + ln);
-        }
-        // ensure function returns res or None
-        pyParts.push('    try:');
-        pyParts.push('        return res');
-        pyParts.push('    except NameError:');
-        pyParts.push('        return None');
-
-        // call the function and serialize result
-        pyParts.push(`out = ${safeFuncName}(__node_args)`);
-        pyParts.push('import json');
-        pyParts.push('from js import setNodeResult');
-        pyParts.push(`setNodeResult(${JSON.stringify(node.id)}, json.dumps(out, default=str))`);
-        const inner = pyParts.join('\n');
-        const wrapped = `\nimport sys\nfrom js import pushDebug, setNodeResult\nclass _W:\n    def write(self,s):\n        try:\n            if s is None: return\n            s2 = str(s)\n            if s2.strip():\n                pushDebug(s2)\n        except Exception as e:\n            pass\n    def flush(self):\n        pass\nsys.stdout = _W()\nsys.stderr = _W()\ntry:\n${inner.split('\n').map(line=> '    ' + line).join('\n')}\nexcept Exception as _e:\n    pushDebug('py exception: ' + str(_e))\n    raise\n`;
-        await pyodide.value.runPythonAsync(wrapped);
-        logDebug('runNode executed', nodeId);
-        try { (node as any).status = 'done'; } catch (e) {}
-      } catch (err: any) {
-        logDebug('runNode py error: ' + (err?.toString ? err.toString() : String(err)));
-        try { (node as any).status = 'error'; } catch (e) {}
-      }
+      const pyResult = await runNodeViaPyodide(node, inputs);
+      emitTraceEvents(node, pyResult.trace, { runId, mode: 'pyodide' });
+      emitNodeEvent(node, 'finish', pyResult.status === 'ok' ? 'ok' : 'error', {
+        runId,
+        mode: 'pyodide',
+        durationMs: pyResult.durationMs,
+        detail: pyResult.error?.message
+      });
     }
 
     async function installPackages() {
@@ -897,6 +1240,7 @@
 
     // Execute entire graph in topological order
     async function executeGraph() {
+      const runId = beginExecutionRun('graph', `nodes=${nodes.length}`);
       try {
         // Build maps of incoming counts and outgoing edges, but ignore disabled nodes
         const incomingCount: Record<string, number> = {};
@@ -940,10 +1284,12 @@
 
         if (reachable.size === 0) {
           logDebug('executeGraph: no reachable nodes to run');
+          endExecutionRun(runId, 'skipped', 'no reachable nodes');
           return;
         }
 
         logDebug('executeGraph starting from', Array.from(initial), 'reachable count', reachable.size);
+        emitWorkflowEvent(runId, 'prepare', 'ok', `start=${initial.length}, reachable=${reachable.size}`);
 
         // working copy of incoming counts for reachable nodes only
         const pending = Object.assign({}, incomingCount);
@@ -956,15 +1302,20 @@
         function spawn(id: string) {
           if (started.has(id)) return;
           started.add(id);
+          const targetNode = nodes.find(n => n.id === id);
+          if (targetNode) {
+            emitNodeEvent(targetNode, 'queue', 'ok', {
+              runId,
+              detail: `pending=${pending[id] || 0}`
+            });
+          }
           (async () => {
             try {
-              await runNode(id);
+              await runNode(id, { runId });
             } catch (e) {
               logDebug('runNode failed for', id, e?.toString ? e.toString() : e);
             }
             // propagate outputs to downstream nodes
-            const src = nodes.find(n => n.id === id);
-            const value = src && ('lastResult' in src) ? (src as any).lastResult : null;
             const outs = outgoingMap[id] || [];
             for (const o of outs) {
               const tgt = o.to.nodeId;
@@ -997,9 +1348,12 @@
           };
           check();
         });
+        const hasError = nodes.some(n => reachable.has(n.id) && (n as any).status === 'error');
+        endExecutionRun(runId, hasError ? 'error' : 'ok', `completed=${completed}/${total}`);
 
       } catch (e) {
         logDebug('executeGraph error', e?.toString ? e.toString() : e);
+        endExecutionRun(runId, 'error', e?.toString ? e.toString() : String(e));
       }
     }
 
@@ -2699,6 +3053,20 @@
       }
     }
 
+    function updateNodeExecutionModeOverride(id: string, mode: 'inherit' | 'runtime' | 'pyodide') {
+      const n = nodes.find(x => x.id === id);
+      if (!n) return;
+      (n as any).meta = (n as any).meta || {};
+      if (mode === 'runtime' || mode === 'pyodide') {
+        (n as any).meta.execution = { ...((n as any).meta.execution || {}), mode };
+        return;
+      }
+      if ((n as any).meta.execution && typeof (n as any).meta.execution === 'object') {
+        delete (n as any).meta.execution.mode;
+        if (!Object.keys((n as any).meta.execution).length) delete (n as any).meta.execution;
+      }
+    }
+
     function attachNodeFiles(id: string, files: File[]) {
       const n = nodes.find(x => x.id === id);
       if (!n) return;
@@ -3039,6 +3407,7 @@
         @update-is-output="handleUpdateIsOutput"
         @update-node-color="handleUpdateNodeColor"
         @update-node-meta-config="handleUpdateNodeMetaConfig"
+        @update-execution-mode-override="handleUpdateExecutionModeOverride"
         @attach-node-files="handleAttachNodeFiles"
         @clear-node-files="handleClearNodeFiles"
         @save-node-template="saveSelectedNodeTemplate"
@@ -3059,6 +3428,8 @@
         :logs="debugLogs"
         :env-vars="envVars"
         :watch-items="watchItems"
+        :node-events="nodeObservabilityEvents"
+        :active-run-id="activeRunId"
         @toggle="bottomCollapsed = !bottomCollapsed"
         @load="loadModule"
         @scroll="scrollToExport"

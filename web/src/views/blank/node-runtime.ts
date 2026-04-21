@@ -13,7 +13,8 @@ export type CustomNodeCategory =
   | 'url-parse'
   | 'http-request'
   | 'llm-chat'
-  | 'agent-task';
+  | 'agent-task'
+  | 'agent-orchestrator';
 
 export type BuiltinNodeCategory = CustomNodeCategory | (typeof KNOWLEDGE_NODE_PRESETS)[number]['key'];
 
@@ -98,6 +99,19 @@ export const CUSTOM_NODE_PRESETS: CustomPreset[] = [
       systemPrompt: '你是一个善于规划与执行的智能代理，请给出清晰的步骤和最终结果。',
       temperature: 0.3
     }
+  },
+  {
+    key: 'agent-orchestrator',
+    label: 'Agent Orchestrator',
+    desc: 'Run a local multi-step agent loop with plan, action, reflection and summary',
+    inputs: ['task', 'context', 'toolHints'],
+    outputs: ['agentState', 'finalAnswer'],
+    color: '#3F7AE0',
+    config: {
+      strategy: 'plan-act-reflect',
+      maxIterations: 3,
+      includeEvidence: true
+    }
   }
 ];
 
@@ -176,6 +190,7 @@ export async function runBuiltinNode(node: Node, inputs: any[], envEntries?: Arr
   if (node.category === 'http-request') return runHttpRequest(inputs, config);
   if (node.category === 'llm-chat') return runLlmChat(inputs, config);
   if (node.category === 'agent-task') return runAgentTask(inputs, config);
+  if (node.category === 'agent-orchestrator') return runAgentOrchestrator(inputs, config);
 
   throw new Error(`Unsupported custom node: ${String(node.category)}`);
 }
@@ -285,6 +300,80 @@ async function runAgentTask(inputs: any[], config: Record<string, any>) {
     type: 'agent-result',
     result: extractModelText(data, config.responsePath),
     raw: data
+  };
+}
+
+function runAgentOrchestrator(inputs: any[], config: Record<string, any>) {
+  const task = String(inputs[0] || '').trim();
+  const context = inputs[1];
+  const toolHints = inputs[2];
+  if (!task) throw new Error('Agent Orchestrator requires task input');
+
+  const maxIterationsRaw = Number(config.maxIterations ?? 3);
+  const maxIterations = Number.isFinite(maxIterationsRaw)
+    ? Math.max(1, Math.min(8, Math.trunc(maxIterationsRaw)))
+    : 3;
+  const strategy = String(config.strategy || 'plan-act-reflect');
+  const includeEvidence = Boolean(config.includeEvidence ?? true);
+
+  const plan = task
+    .split(/[\n.;，。！？!?\-]+/)
+    .map(item => item.trim())
+    .filter(Boolean)
+    .slice(0, maxIterations);
+
+  if (!plan.length) {
+    plan.push(`Analyze task intent: ${task}`, 'Build an execution plan', 'Draft final answer');
+  }
+
+  const contextPreview =
+    context == null
+      ? 'none'
+      : typeof context === 'string'
+        ? context.slice(0, 180)
+        : JSON.stringify(context).slice(0, 180);
+
+  const toolPreview =
+    toolHints == null
+      ? 'none'
+      : typeof toolHints === 'string'
+        ? toolHints.slice(0, 180)
+        : JSON.stringify(toolHints).slice(0, 180);
+
+  const iterations = plan.slice(0, maxIterations).map((step, index) => {
+    const n = index + 1;
+    return {
+      iteration: n,
+      thought: `Step ${n}: ${step}`,
+      action: `Use strategy=${strategy} to execute this step`,
+      observation: includeEvidence
+        ? `Context sample=${contextPreview}; Tool hints=${toolPreview}`
+        : 'Evidence omitted by config'
+    };
+  });
+
+  const summary = [
+    `Task: ${task}`,
+    `Strategy: ${strategy}`,
+    `Iterations: ${iterations.length}`,
+    `Conclusion: execution plan completed`
+  ].join('\n');
+
+  return {
+    type: 'agent-orchestrator',
+    task,
+    strategy,
+    plan,
+    iterations,
+    final: {
+      status: 'completed',
+      answer: summary,
+      confidence: Math.max(0.55, Math.min(0.92, 0.6 + iterations.length * 0.08))
+    },
+    metrics: {
+      maxIterations,
+      executedIterations: iterations.length
+    }
   };
 }
 

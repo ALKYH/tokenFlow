@@ -152,7 +152,12 @@ const CUSTOM_PRESETS: NodePreset[] = CUSTOM_NODE_PRESETS.map(item => ({
   label: item.label,
   desc: item.desc,
   nodeKind: 'custom',
-  categoryGroup: item.key === 'llm-chat' || item.key === 'agent-task' ? 'llm' : item.key === 'file-read' || item.key === 'file-write' || item.key === 'url-parse' || item.key === 'http-request' ? 'tools' : 'knowledge',
+  categoryGroup:
+    item.key === 'llm-chat' || item.key === 'agent-task' || item.key === 'agent-orchestrator'
+      ? 'llm'
+      : item.key === 'file-read' || item.key === 'file-write' || item.key === 'url-parse' || item.key === 'http-request'
+        ? 'tools'
+        : 'knowledge',
   inputs: item.inputs,
   outputs: item.outputs,
   color: item.color
@@ -265,6 +270,34 @@ export const WORKFLOW_TEMPLATES: WorkflowTemplate[] = [
       { presetKey: 'agent-task', dx: 260, dy: 0, isOutput: true }
     ],
     edges: [{ from: 0, fromPort: 0, to: 1, toPort: 0 }]
+  },
+  {
+    key: 'agent-observable-loop',
+    label: 'Agent Observable Loop',
+    desc: 'Slightly complex local agent graph with branching, tool parsing and merge output.',
+    group: 'llm',
+    nodes: [
+      { presetKey: 'text', dx: 0, dy: 0, label: 'Task Input', code: 'res = "Draft a launch checklist for a new AI workflow project."', isInit: true },
+      { presetKey: 'text', dx: 0, dy: 170, label: 'Tool URL', code: 'res = "https://tokenflow.local/tools?source=workspace&env=dev"', isInit: true },
+      { presetKey: 'url-parse', dx: 260, dy: 170, label: 'Parse Tool URL' },
+      {
+        presetKey: 'agent-orchestrator',
+        dx: 520,
+        dy: 40,
+        label: 'Agent Core',
+        meta: { config: { strategy: 'plan-act-reflect', maxIterations: 4, includeEvidence: true } }
+      },
+      { presetKey: 'dict-merge', dx: 800, dy: 80, label: 'Merge Agent + Tools' },
+      { presetKey: 'print', dx: 1060, dy: 80, label: 'Result Console', isOutput: true }
+    ],
+    edges: [
+      { from: 0, fromPort: 0, to: 3, toPort: 0 },
+      { from: 1, fromPort: 0, to: 2, toPort: 0 },
+      { from: 2, fromPort: 0, to: 3, toPort: 1 },
+      { from: 2, fromPort: 0, to: 4, toPort: 1 },
+      { from: 3, fromPort: 0, to: 4, toPort: 0 },
+      { from: 4, fromPort: 0, to: 5, toPort: 0 }
+    ]
   },
   {
     key: 'matrix-lab',

@@ -1,0 +1,31 @@
+name: Encoding Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  encoding-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run encoding audit
+        run: |
+          python scripts/week7_encoding_audit.py \
+            --output output/week7/encoding-audit-report.json \
+            --fail-on-issues
+
+      - name: Upload encoding report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: week7-encoding-audit-report
+          path: output/week7/encoding-audit-report.json

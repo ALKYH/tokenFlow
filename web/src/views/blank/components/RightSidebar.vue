@@ -33,6 +33,7 @@ const emit = defineEmits<{
   (e: 'saveNodeTemplate'): void
   (e: 'uploadNodeTemplate'): void
   (e: 'updateNodeNote', value: string): void
+  (e: 'updateExecutionModeOverride', mode: 'inherit' | 'runtime' | 'pyodide'): void
 }>();
 
 const activeTab = ref<'props' | 'styles'>('props');
@@ -44,6 +45,16 @@ const isLlmNode = computed(() => ['llm-chat', 'agent-task'].includes(props.selec
 const hideRawCodeEditor = computed(
   () => props.executionMode === 'runtime' && !isBuiltinConfigNode.value && props.selectedNode?.category !== 'note'
 );
+const executionModeOverride = computed<'inherit' | 'runtime' | 'pyodide'>(() => {
+  const mode = props.selectedNode?.meta?.execution?.mode;
+  if (mode === 'runtime' || mode === 'pyodide') return mode;
+  return 'inherit';
+});
+const executionModeOptions = [
+  { label: 'Inherit Workspace', value: 'inherit' },
+  { label: 'Runtime', value: 'runtime' },
+  { label: 'Pyodide', value: 'pyodide' }
+];
 
 const llmConfig = computed(() => {
   const config = props.selectedNode?.meta?.config || {};
@@ -160,6 +171,11 @@ function onNoteInput(e: Event) {
   emit('updateNodeNote', (e.target as HTMLTextAreaElement).value);
 }
 
+function onExecutionModeOverrideChange(value: string | null) {
+  const mode = value === 'runtime' || value === 'pyodide' ? value : 'inherit';
+  emit('updateExecutionModeOverride', mode);
+}
+
 function isNoteNode(node: any) {
   return node?.category === 'note';
 }
@@ -221,6 +237,11 @@ function isChildEnabled(folder: any, childId: string) {
           <div class="section-title">节点信息</div>
           <div class="prop-row"><label>Id</label><div class="prop-val">{{ selectedNode.id }}</div></div>
           <div class="prop-row"><label>标题</label><input class="prop-input" :value="selectedNode?.label" @input="$emit('updateLabel', $event)" /></div>
+
+          <div v-if="!isBuiltinConfigNode && !isNoteNode(selectedNode)" class="prop-row">
+            <label>Exec Mode</label>
+            <NSelect :value="executionModeOverride" :options="executionModeOptions" @update:value="onExecutionModeOverrideChange" />
+          </div>
 
           <div class="toggle-grid">
             <label class="flag-card"><span>起始点</span><input type="checkbox" :checked="selectedNode?.isInit" @change="e => emit('updateIsInit', (e.target as HTMLInputElement).checked)" /></label>

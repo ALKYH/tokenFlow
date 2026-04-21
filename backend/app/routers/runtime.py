@@ -32,7 +32,8 @@ router = APIRouter(prefix='/api/runtime', tags=['runtime'])
                             'max_output_chars': 200000
                         },
                         'dependencies': {
-                            'llama_cpp_available': True
+                            'llama_cpp_available': True,
+                            'vllm_available': False
                         }
                     }
                 }
