@@ -1,10 +1,25 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import asdict
+from time import sleep
 from typing import Any
+import uuid
 
-from .state import append_trace, build_error_info, ensure_graph_state
 from .graph_types import GraphNode, GraphState
+from .harness import (
+    AgentExecutor,
+    ExecutionContext,
+    ExecutionRequest,
+    ExecutionResult,
+    FunctionCallExecutor,
+    HarnessRegistry,
+    RuntimeBackendExecutor,
+    SkillExecutor,
+    ToolExecutor,
+    TraceSpan,
+)
+from .state import append_span, append_trace, build_error_info, ensure_graph_state
 
 SAFE_BUILTINS = {
     "abs": abs,
@@ -24,6 +39,7 @@ SAFE_BUILTINS = {
     "round": round,
     "RuntimeError": RuntimeError,
     "set": set,
+    "sleep": sleep,
     "str": str,
     "sum": sum,
     "tuple": tuple,
@@ -135,7 +151,7 @@ class PythonSnippetNodeExecutor(BaseNodeExecutor):
         source = prepared["source"]
         for token in BLACKLISTED_SNIPPET_TOKENS:
             if token in source:
-                raise ValueError(f"python_snippet 含有不允许的调用: {token}")
+                raise ValueError(f"python_snippet 包含不允许的调用: {token}")
 
         function_name = prepared["function_name"]
         globals_scope = {"__builtins__": SAFE_BUILTINS}
@@ -168,4 +184,155 @@ class PrintNodeExecutor(BaseNodeExecutor):
             context["logs"] = logs
         logs.append(output)
         next_state["result"] = state.get("result")
+        return next_state
+
+
+class PythonSnippetRuntimeBackend(RuntimeBackendExecutor):
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        payload = request.payload
+        source = str(payload.get("source", "")).strip()
+        function_name = str(payload.get("function_name", "__tokenflow_node_entry")).strip()
+        if not source:
+            raise ValueError("runtime backend requires source")
+        for token in BLACKLISTED_SNIPPET_TOKENS:
+            if token in source:
+                raise ValueError(f"runtime backend contains blocked token: {token}")
+
+        globals_scope = {"__builtins__": SAFE_BUILTINS}
+        locals_scope: dict[str, Any] = {}
+        exec(source, globals_scope, locals_scope)  # noqa: S102
+        callable_target = locals_scope.get(function_name) or globals_scope.get(function_name)
+        if not callable(callable_target):
+            raise ValueError(f"runtime backend function not found: {function_name}")
+
+        args = list(payload.get("args") or [])
+        kwargs = dict(payload.get("kwargs") or {})
+        output = callable_target(*args, **kwargs)
+        return ExecutionResult(output=output)
+
+
+class EchoToolExecutor(ToolExecutor):
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        payload = request.payload
+        tool_name = str(payload.get("tool_name") or "tool")
+        value = payload.get("value", request.context.shared_memory.get("last_result"))
+        return ExecutionResult(
+            output={"tool_name": tool_name, "value": value},
+            metadata={"tool_name": tool_name},
+        )
+
+
+class EchoSkillExecutor(SkillExecutor):
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        payload = request.payload
+        skill_name = str(payload.get("skill_name") or "skill")
+        value = payload.get("value", request.context.shared_memory.get("last_result"))
+        return ExecutionResult(
+            output={"skill_name": skill_name, "value": value},
+            metadata={"skill_name": skill_name},
+        )
+
+
+class EchoAgentExecutor(AgentExecutor):
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        payload = request.payload
+        agent_name = str(payload.get("agent_name") or "agent")
+        steps = list(payload.get("steps") or [])
+        output = {
+            "agent_name": agent_name,
+            "steps": steps,
+            "input": payload.get("value", request.context.shared_memory.get("last_result")),
+        }
+        return ExecutionResult(output=output, metadata={"agent_name": agent_name})
+
+
+class EchoFunctionCallExecutor(FunctionCallExecutor):
+    def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        payload = request.payload
+        function_name = str(payload.get("function_name") or "function")
+        arguments = dict(payload.get("arguments") or {})
+        return ExecutionResult(
+            output={"function_name": function_name, "arguments": arguments},
+            metadata={"function_name": function_name},
+        )
+
+
+def create_default_harness_registry() -> HarnessRegistry:
+    registry = HarnessRegistry()
+    registry.register("runtime", PythonSnippetRuntimeBackend())
+    registry.register("tool", EchoToolExecutor())
+    registry.register("skill", EchoSkillExecutor())
+    registry.register("agent", EchoAgentExecutor())
+    registry.register("function", EchoFunctionCallExecutor())
+    return registry
+
+
+class HarnessNodeExecutor(BaseNodeExecutor):
+    def __init__(self, harness_registry: HarnessRegistry | None = None) -> None:
+        self.harness_registry = harness_registry or create_default_harness_registry()
+
+    def prepare(self, state: GraphState, node: GraphNode) -> dict[str, Any]:
+        config = dict(node.config)
+        backend = str(config.get("backend", "runtime")).strip() or "runtime"
+        payload = dict(config.get("payload") or {})
+        if backend == "runtime":
+            payload.setdefault("source", config.get("source", ""))
+            payload.setdefault("function_name", config.get("function_name", "__tokenflow_node_entry"))
+            if "args" not in payload and "kwargs" not in payload:
+                payload["args"] = [state.get("result"), state.get("context"), state.get("resources")]
+                payload["kwargs"] = {}
+        return {"backend": backend, "payload": payload, "config": config}
+
+    def run(self, state: GraphState, node: GraphNode, prepared: dict[str, Any]) -> Any:
+        backend = prepared["backend"]
+        executor = self.harness_registry.get(backend)
+        execution = state.get("execution", {})
+        context = ExecutionContext(
+            workflow_id=str(state.get("workflow_id", "")),
+            workflow_version=str(state.get("workflow_version", "")),
+            execution_id=str(execution.get("execution_id", "")),
+            node_id=node.node_id,
+            node_type=node.node_type,
+            backend=backend,
+            run_context={"workflow_id": state.get("workflow_id", ""), "execution": dict(execution)},
+            node_context={"config": dict(node.config)},
+            agent_context={},
+            shared_memory={"last_result": state.get("result"), "resources": state.get("resources")},
+            scratchpad={},
+            trace_spans=[],
+        )
+        span_id = uuid.uuid4().hex
+        span = TraceSpan(
+            span_id=span_id,
+            parent_span_id=None,
+            layer=executor.layer,
+            executor_type=executor.executor_type,
+            node_id=node.node_id,
+            status="ok",
+            detail=f"backend={backend}",
+        )
+        request = ExecutionRequest(payload=prepared["payload"], config=prepared["config"], context=context)
+        result = executor.execute(request)
+        context.trace_spans.append(span)
+        result_spans = tuple(list(result.trace_spans) + [span])
+        return {"output": result.output, "spans": result_spans, "metadata": dict(result.metadata), "backend": backend}
+
+    def postprocess(self, state: GraphState, node: GraphNode, output: Any) -> GraphState:
+        if not isinstance(output, dict) or "output" not in output:
+            return super().postprocess(state, node, output)
+
+        next_state = ensure_graph_state(state)
+        context = next_state["context"]
+        outputs = context.get("node_outputs")
+        if not isinstance(outputs, dict):
+            outputs = {}
+            context["node_outputs"] = outputs
+        outputs[node.node_id] = output["output"]
+        context.setdefault("backend_results", {})[node.node_id] = {
+            "backend": output.get("backend"),
+            "metadata": dict(output.get("metadata") or {}),
+        }
+        next_state["result"] = output["output"]
+        for item in output.get("spans", ()):
+            append_span(next_state, **asdict(item))
         return next_state

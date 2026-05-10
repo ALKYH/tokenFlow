@@ -11,6 +11,8 @@ from .routers import rag as rag_router
 from .routers import routing as routing_router
 from .routers import runtime as runtime_router
 from .routers import workspaces as workspaces_router
+from .services.routing_queue_service import routing_queue_service
+from .services.runtime_queue_service import runtime_queue_service
 from .seed import seed_initial_data
 
 app = FastAPI(title='tokenFlow Auth')
@@ -40,6 +42,14 @@ async def on_startup():
     await ensure_runtime_schema()
     await ensure_rag_schema()
     await seed_initial_data()
+    await routing_queue_service.startup()
+    await runtime_queue_service.startup()
+
+
+@app.on_event('shutdown')
+async def on_shutdown():
+    await routing_queue_service.shutdown()
+    await runtime_queue_service.shutdown()
 
 
 @app.get('/health')

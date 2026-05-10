@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from typing import Type
 
-from .executors import BaseNodeExecutor, ConstNodeExecutor, PrintNodeExecutor, PythonSnippetNodeExecutor
+from .executors import (
+    BaseNodeExecutor,
+    ConstNodeExecutor,
+    HarnessNodeExecutor,
+    PrintNodeExecutor,
+    PythonSnippetNodeExecutor,
+)
 
 
 class NodeRegistry:
@@ -35,5 +41,8 @@ def create_default_registry() -> NodeRegistry:
     registry.register("const", ConstNodeExecutor)
     registry.register("python_snippet", PythonSnippetNodeExecutor)
     registry.register("print", PrintNodeExecutor)
+    registry.register("tool", HarnessNodeExecutor)
+    registry.register("skill", HarnessNodeExecutor)
+    registry.register("agent", HarnessNodeExecutor)
+    registry.register("function", HarnessNodeExecutor)
     return registry
-

@@ -1,130 +1,30 @@
-from typing import Any
-import httpx
 from sqlalchemy import asc, select
 from fastapi import APIRouter, Depends, HTTPException
+
 from ..deps import get_optional_user, get_session
 from ..models.routing_rule import RoutingRule
 from ..schemas.routing import (
+    QueueDeadLetterRead,
+    QueueMetricAggregateRead,
+    QueueMetricRecordRead,
     RoutingClassifyRequest,
     RoutingClassifyResponse,
+    RoutingQueueHealth,
     RoutingResolveRequest,
     RoutingRuleCreate,
     RoutingRuleRead,
     RoutingRuleUpdate,
-    RoutingSummary
+    RoutingSummary,
 )
-from ..services.secret_service import build_runtime_secret, resolve_user_secret
+from ..services.queue_metrics_service import (
+    aggregate_routing_metrics,
+    list_routing_dead_letters,
+    list_routing_metrics,
+)
+from ..services.routing_queue_service import RoutingQueueError, routing_queue_service
+from ..services.routing_service import classify_routing_request, resolve_routing_context
 
 router = APIRouter(prefix='/api/routing', tags=['routing'])
-
-FILE_TYPE_ROUTE_MAP = {
-    'workspace': ('workspace', 'editor'),
-    'module': ('marketplace', 'editor'),
-    'plugin': ('marketplace', 'community'),
-    'workflow': ('routing', 'editor'),
-    'knowledge': ('knowledge', 'api'),
-    'pdf': ('knowledge', 'api'),
-    'image': ('vision', 'api'),
-    'audio': ('speech', 'api')
-}
-
-
-def _resolve_category_and_channel(payload: RoutingResolveRequest, runtime_secret: dict) -> tuple[str, str, str]:
-    if payload.category and payload.channel:
-        return payload.category, payload.channel, 'manual'
-
-    file_type = (payload.file_type or '').strip().lower()
-    if file_type in FILE_TYPE_ROUTE_MAP:
-        category, channel = FILE_TYPE_ROUTE_MAP[file_type]
-        return payload.category or category, payload.channel or channel, 'file-type'
-
-    provider = str(runtime_secret.get('provider') or '').lower()
-    prefix = str(runtime_secret.get('request_prefix') or '').lower()
-    if 'embedding' in prefix or 'vector' in prefix:
-        return payload.category or 'knowledge', payload.channel or 'api', 'api'
-    if provider in {'openai', 'azure-openai', 'anthropic', 'custom'}:
-        return payload.category or 'routing', payload.channel or 'api', 'api'
-    return payload.category or 'general', payload.channel or 'dashboard', 'fallback'
-
-
-def _match_rule(rule: RoutingRule, text: str) -> tuple[bool, float, str]:
-    normalized = (text or '').lower()
-    keywords = [str(item).lower() for item in (rule.matcher_config or {}).get('keywords', [])]
-    if not keywords:
-        return False, 0, 'No keywords configured'
-    hits = [keyword for keyword in keywords if keyword and keyword in normalized]
-    if not hits:
-        return False, 0, 'No keyword hit'
-    score = min(1.0, len(hits) / max(1, len(keywords)))
-    return True, score, f"Matched keywords: {', '.join(hits[:4])}"
-
-
-async def _classify_with_ai(
-    payload: RoutingClassifyRequest,
-    rules: list[RoutingRule],
-    runtime_secret: dict,
-    resolved_category: str,
-    resolved_channel: str,
-    route_kind: str
-) -> RoutingClassifyResponse | None:
-    ai_endpoint = payload.ai_endpoint or runtime_secret.get('request_prefix')
-    if not ai_endpoint:
-        return None
-    prompt_rules = [
-        {
-            'name': rule.name,
-            'category': rule.category,
-            'channel': rule.channel,
-            'action': rule.action_config
-        }
-        for rule in rules
-    ]
-    body: dict[str, Any] = {
-        'model': payload.model or 'gpt-4o-mini',
-        'messages': [
-            {
-                'role': 'system',
-                'content': 'Classify the message to the best routing rule and return JSON with rule_name, reason, score.'
-            },
-            {
-                'role': 'user',
-                'content': {
-                    'category': resolved_category,
-                    'channel': resolved_channel,
-                    'text': payload.text,
-                    'rules': prompt_rules
-                }
-            }
-        ]
-    }
-    headers = {'Content-Type': 'application/json'}
-    auth_key = payload.api_key or runtime_secret.get('api_key')
-    if auth_key:
-        headers['Authorization'] = f'Bearer {auth_key}'
-    async with httpx.AsyncClient(timeout=18.0) as client:
-        response = await client.post(ai_endpoint, json=body, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-    content = ''
-    try:
-        content = data['choices'][0]['message']['content']
-    except Exception:
-        content = str(data)
-    for rule in rules:
-        if rule.name in content:
-            return RoutingClassifyResponse(
-                mode='ai',
-                matched=True,
-                rule_name=rule.name,
-                score=0.88,
-                reason=content[:240],
-                target=rule.action_config or {},
-                resolved_category=resolved_category,
-                resolved_channel=resolved_channel,
-                selected_api={k: v for k, v in runtime_secret.items() if k != 'api_key'},
-                route_kind=route_kind
-            )
-    return None
 
 
 @router.get('/rules', response_model=list[RoutingRuleRead])
@@ -145,8 +45,54 @@ async def get_routing_summary(session=Depends(get_session), user=Depends(get_opt
         categories=categories,
         channels=channels,
         rule_count=len(rules),
-        enabled_count=sum(1 for rule in rules if rule.enabled)
+        enabled_count=sum(1 for rule in rules if rule.enabled),
     )
+
+
+@router.get('/queue/health', response_model=RoutingQueueHealth)
+async def get_queue_health(_user=Depends(get_optional_user)):
+    return await routing_queue_service.get_health()
+
+
+@router.get('/queue/dead-letters', response_model=list[QueueDeadLetterRead])
+async def get_routing_dead_letters(limit: int = 20, _user=Depends(get_optional_user)):
+    rows = await list_routing_dead_letters(limit=limit)
+    return [
+        QueueDeadLetterRead(
+            request_id=row.request_id,
+            queue_backend=row.queue_backend,
+            error_code=row.error_code,
+            error_message=row.error_message,
+            attempts=row.attempts,
+            created_at=row.created_at,
+            last_attempt_at=row.last_attempt_at,
+            wait_time_ms=row.wait_time_ms,
+        )
+        for row in rows
+    ]
+
+
+@router.get('/queue/metrics', response_model=list[QueueMetricRecordRead])
+async def get_routing_metrics(limit: int = 50, _user=Depends(get_optional_user)):
+    rows = await list_routing_metrics(limit=limit)
+    return [
+        QueueMetricRecordRead(
+            request_id=row.request_id,
+            queue_backend=row.queue_backend,
+            status=row.status,
+            duration_ms=row.duration_ms,
+            wait_time_ms=row.wait_time_ms,
+            attempts=row.attempts,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@router.get('/queue/metrics/aggregate', response_model=list[QueueMetricAggregateRead])
+async def get_routing_metrics_aggregate(limit: int = 200, _user=Depends(get_optional_user)):
+    rows = await aggregate_routing_metrics(limit=limit)
+    return [QueueMetricAggregateRead(**row) for row in rows]
 
 
 @router.post('/rules', response_model=RoutingRuleRead)
@@ -178,70 +124,22 @@ async def update_rule(rule_id: int, payload: RoutingRuleUpdate, session=Depends(
 
 
 @router.post('/resolve', response_model=RoutingClassifyResponse)
-async def resolve_routing_context(payload: RoutingResolveRequest, session=Depends(get_session), user=Depends(get_optional_user)):
-    runtime_secret = {}
-    if user:
-        runtime_secret = build_runtime_secret(await resolve_user_secret(session, user.id, payload.api_name))
-    resolved_category, resolved_channel, route_kind = _resolve_category_and_channel(payload, runtime_secret)
-    return RoutingClassifyResponse(
-        mode='resolve',
-        matched=False,
-        reason='Resolved routing context',
-        target={},
-        resolved_category=resolved_category,
-        resolved_channel=resolved_channel,
-        selected_api={k: v for k, v in runtime_secret.items() if k != 'api_key'},
-        route_kind=route_kind
-    )
+async def resolve_routing_context_endpoint(
+    payload: RoutingResolveRequest,
+    session=Depends(get_session),
+    user=Depends(get_optional_user),
+):
+    user_id = user.id if user else None
+    return await resolve_routing_context(payload, session=session, user_id=user_id)
 
 
 @router.post('/classify', response_model=RoutingClassifyResponse)
 async def classify_message(payload: RoutingClassifyRequest, session=Depends(get_session), user=Depends(get_optional_user)):
-    runtime_secret = {}
-    if user:
-        runtime_secret = build_runtime_secret(await resolve_user_secret(session, user.id, payload.api_name))
-    resolved_category, resolved_channel, route_kind = _resolve_category_and_channel(payload, runtime_secret)
-
-    stmt = select(RoutingRule).where(
-        RoutingRule.enabled.is_(True),
-        RoutingRule.category == resolved_category,
-        RoutingRule.channel == resolved_channel
-    )
-    if user:
-        stmt = stmt.where((RoutingRule.is_public.is_(True)) | (RoutingRule.owner_id == user.id))
-    else:
-        stmt = stmt.where(RoutingRule.is_public.is_(True))
-    result = await session.execute(stmt.order_by(asc(RoutingRule.priority), asc(RoutingRule.id)))
-    rules = list(result.scalars().all())
-
-    if payload.use_ai:
-        ai_result = await _classify_with_ai(payload, rules, runtime_secret, resolved_category, resolved_channel, route_kind)
-        if ai_result:
-            return ai_result
-
-    for rule in rules:
-        matched, score, reason = _match_rule(rule, payload.text)
-        if matched:
-            return RoutingClassifyResponse(
-                mode='rule',
-                matched=True,
-                rule_name=rule.name,
-                score=score,
-                reason=reason,
-                target=rule.action_config or {},
-                resolved_category=resolved_category,
-                resolved_channel=resolved_channel,
-                selected_api={k: v for k, v in runtime_secret.items() if k != 'api_key'},
-                route_kind=route_kind
-            )
-
-    return RoutingClassifyResponse(
-        mode='rule',
-        matched=False,
-        reason='No routing rule matched',
-        target={},
-        resolved_category=resolved_category,
-        resolved_channel=resolved_channel,
-        selected_api={k: v for k, v in runtime_secret.items() if k != 'api_key'},
-        route_kind=route_kind
-    )
+    user_id = user.id if user else None
+    if not routing_queue_service.config.execute_through_queue:
+        return await classify_routing_request(payload, session=session, user_id=user_id)
+    try:
+        return await routing_queue_service.classify(payload, user_id=user_id)
+    except RoutingQueueError as exc:
+        status_code = 504 if exc.code == 'ROUTING_QUEUE_TIMEOUT' else 503
+        raise HTTPException(status_code=status_code, detail=exc.message) from exc

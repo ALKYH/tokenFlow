@@ -15,6 +15,10 @@ def ensure_graph_state(raw_state: GraphState | None) -> GraphState:
         "result": copy.deepcopy(source.get("result")),
         "error": copy.deepcopy(source.get("error")),
         "trace": copy.deepcopy(source.get("trace", [])),
+        "spans": copy.deepcopy(source.get("spans", [])),
+        "workflow_id": copy.deepcopy(source.get("workflow_id", "")),
+        "workflow_version": copy.deepcopy(source.get("workflow_version", "")),
+        "execution": copy.deepcopy(source.get("execution", {})),
     }
     if not isinstance(state["input"], dict):
         state["input"] = {}
@@ -22,6 +26,10 @@ def ensure_graph_state(raw_state: GraphState | None) -> GraphState:
         state["context"] = {}
     if not isinstance(state["trace"], list):
         state["trace"] = []
+    if not isinstance(state["spans"], list):
+        state["spans"] = []
+    if not isinstance(state["execution"], dict):
+        state["execution"] = {}
     return state
 
 
@@ -52,3 +60,27 @@ def build_error_info(node: GraphNode, phase: str, exc: Exception) -> ErrorInfo:
         "message": str(exc),
         "traceback": traceback.format_exc(),
     }
+
+
+def append_span(
+    state: GraphState,
+    *,
+    span_id: str,
+    parent_span_id: str | None,
+    layer: str,
+    executor_type: str,
+    node_id: str,
+    status: str,
+    detail: str | None = None,
+) -> None:
+    item = {
+        "span_id": span_id,
+        "parent_span_id": parent_span_id,
+        "layer": layer,
+        "executor_type": executor_type,
+        "node_id": node_id,
+        "status": status,
+    }
+    if detail:
+        item["detail"] = detail
+    state["spans"].append(item)

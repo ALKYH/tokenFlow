@@ -1,6 +1,7 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
+    container_name: tokenflow-postgres
     environment:
       POSTGRES_DB: tokenflow
       POSTGRES_USER: postgres
@@ -9,18 +10,45 @@ services:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tokenflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  backend:
+  redis:
+    image: redis:7-alpine
+    container_name: tokenflow-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend-api:
     build:
       context: ./backend
+      target: api
+    container_name: tokenflow-backend-api
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tokenflow
       SECRET_KEY: dev-secret
       FRONTEND_ORIGINS: http://localhost:5173
       TOKENFLOW_STORAGE_DIR: /app/storage
       TOKENFLOW_MODELS_DIR: /app/models
+      TOKENFLOW_REDIS_URL: redis://redis:6379/0
+      TOKENFLOW_ROUTING_QUEUE_BACKEND: redis
+      TOKENFLOW_RUNTIME_QUEUE_BACKEND: redis
       TOKENFLOW_RUNTIME_TIMEOUT_SECONDS: 20
       TOKENFLOW_RUNTIME_MAX_CONCURRENCY: 2
       TOKENFLOW_RUNTIME_MODEL_BACKEND: llama-cpp-python
@@ -35,5 +63,39 @@ services:
       - ./backend/storage:/app/storage
       - ./models:/app/models:ro
 
+  runtime-worker:
+    build:
+      context: ./backend
+      target: runtime-worker
+    container_name: tokenflow-runtime-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/tokenflow
+      SECRET_KEY: dev-secret
+      FRONTEND_ORIGINS: http://localhost:5173
+      TOKENFLOW_STORAGE_DIR: /app/storage
+      TOKENFLOW_MODELS_DIR: /app/models
+      TOKENFLOW_REDIS_URL: redis://redis:6379/0
+      TOKENFLOW_RUNTIME_QUEUE_BACKEND: redis
+      TOKENFLOW_ROUTING_QUEUE_BACKEND: redis
+      TOKENFLOW_RUNTIME_TIMEOUT_SECONDS: 20
+      TOKENFLOW_RUNTIME_MAX_CONCURRENCY: 2
+      TOKENFLOW_RUNTIME_MODEL_BACKEND: llama-cpp-python
+      TOKENFLOW_RAG_VECTOR_DIM: 256
+      TOKENFLOW_RAG_CHUNK_SIZE: 700
+      TOKENFLOW_RAG_CHUNK_OVERLAP: 120
+      TOKENFLOW_RAG_DEFAULT_TOP_K: 5
+      TOKENFLOW_RAG_CACHE_TTL_SECONDS: 900
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./models:/app/models:ro
+
 volumes:
   pg_data:
+  redis_data:

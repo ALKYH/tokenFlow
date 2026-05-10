@@ -6,7 +6,7 @@ from ..models.workspace_file import WorkspaceFile
 from ..schemas.plugin import PluginCreate, PluginInstallResponse, PluginPublishFromWorkspace, PluginRead
 from ..schemas.routing import RoutingResolveRequest
 from ..services.secret_service import build_runtime_secret, resolve_user_secret
-from .routing import _resolve_category_and_channel
+from ..services.routing_service import resolve_category_and_channel
 
 router = APIRouter(prefix='/api/plugins', tags=['plugins'])
 
@@ -88,7 +88,7 @@ async def publish_workspace_as_plugin(payload: PluginPublishFromWorkspace, sessi
         raise HTTPException(status_code=409, detail='Plugin slug already exists')
 
     runtime_secret = build_runtime_secret(await resolve_user_secret(session, user.id, payload.request_api_name))
-    resolved_category, resolved_channel, route_kind = _resolve_category_and_channel(
+    resolved_category, resolved_channel, route_kind = resolve_category_and_channel(
         RoutingResolveRequest(
             category=payload.category,
             channel=None,
